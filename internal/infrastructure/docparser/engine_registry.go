@@ -3,6 +3,7 @@ package docparser
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -43,21 +44,84 @@ type ReaderDeps struct {
 
 // localEngines holds all locally registered parser engines, in registration
 // order — which is also the order the engine list is shown in.
-var localEngines []EngineRegistration
+var (
+	localEnginesMu      sync.RWMutex
+	localEngines        = make(map[string]EngineRegistration)
+	localEngineOrder    []string
+	declaredEngines     = make(map[string]EngineRegistration)
+	declaredEngineOrder []string
+)
 
-// RegisterEngine adds an engine to the local registry. Called from init().
+// RegisterEngine retains the legacy declaration entry point without publishing
+// the engine to parser requests. PluginManager is the sole production publisher.
 func RegisterEngine(e EngineRegistration) {
-	localEngines = append(localEngines, e)
+	if e == nil || e.Name() == "" {
+		panic("parser engine name and implementation are required")
+	}
+	localEnginesMu.Lock()
+	defer localEnginesMu.Unlock()
+	if _, exists := declaredEngines[e.Name()]; exists {
+		panic(fmt.Sprintf("parser engine %q declared twice", e.Name()))
+	}
+	declaredEngines[e.Name()] = e
+	declaredEngineOrder = append(declaredEngineOrder, e.Name())
+}
+
+func BuiltinEngineRegistrations() []EngineRegistration {
+	localEnginesMu.RLock()
+	defer localEnginesMu.RUnlock()
+	result := make([]EngineRegistration, 0, len(declaredEngineOrder))
+	for _, name := range declaredEngineOrder {
+		result = append(result, declaredEngines[name])
+	}
+	return result
+}
+
+// PublishEngine makes a declared engine available to new parser requests.
+func PublishEngine(e EngineRegistration) error {
+	if e == nil || e.Name() == "" {
+		return fmt.Errorf("parser engine name and implementation are required")
+	}
+	localEnginesMu.Lock()
+	defer localEnginesMu.Unlock()
+	if _, exists := localEngines[e.Name()]; exists {
+		return fmt.Errorf("parser engine %q already registered", e.Name())
+	}
+	localEngines[e.Name()] = e
+	localEngineOrder = append(localEngineOrder, e.Name())
+	return nil
+}
+
+// UnregisterEngine removes an engine from new request routing.
+func UnregisterEngine(name string) error {
+	localEnginesMu.Lock()
+	defer localEnginesMu.Unlock()
+	if _, exists := localEngines[name]; !exists {
+		return fmt.Errorf("parser engine %q not registered", name)
+	}
+	delete(localEngines, name)
+	for index, registeredName := range localEngineOrder {
+		if registeredName == name {
+			localEngineOrder = append(localEngineOrder[:index], localEngineOrder[index+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+func HasEngine(name string) bool {
+	localEnginesMu.RLock()
+	defer localEnginesMu.RUnlock()
+	_, exists := localEngines[name]
+	return exists
 }
 
 // lookupEngine returns the locally registered engine with this name.
 func lookupEngine(name string) (EngineRegistration, bool) {
-	for _, engine := range localEngines {
-		if engine.Name() == name {
-			return engine, true
-		}
-	}
-	return nil, false
+	localEnginesMu.RLock()
+	defer localEnginesMu.RUnlock()
+	engine, exists := localEngines[name]
+	return engine, exists
 }
 
 // NewReader builds the reader for an engine.
@@ -100,15 +164,22 @@ func remoteReader(deps ReaderDeps) (interfaces.DocReader, error) {
 func ListAllEngines(
 	docreaderConnected bool, overrides map[string]string, remoteEngines []types.ParserEngineInfo,
 ) []types.ParserEngineInfo {
+	localEnginesMu.RLock()
+	engines := make([]EngineRegistration, 0, len(localEngineOrder))
+	for _, name := range localEngineOrder {
+		engines = append(engines, localEngines[name])
+	}
+	localEnginesMu.RUnlock()
+
 	remoteMap := make(map[string]types.ParserEngineInfo, len(remoteEngines))
 	for _, re := range remoteEngines {
 		remoteMap[re.Name] = re
 	}
 
-	seen := make(map[string]bool, len(localEngines))
-	result := make([]types.ParserEngineInfo, 0, len(localEngines)+len(remoteEngines))
+	seen := make(map[string]bool, len(engines))
+	result := make([]types.ParserEngineInfo, 0, len(engines)+len(remoteEngines))
 
-	for _, e := range localEngines {
+	for _, e := range engines {
 		name := e.Name()
 		seen[name] = true
 

@@ -157,15 +157,69 @@ type Provider interface {
 
 // registry 存储所有注册的提供者
 var (
-	registryMu sync.RWMutex
-	registry   = make(map[ProviderName]Provider)
+	registryMu   sync.RWMutex
+	registry     = make(map[ProviderName]Provider)
+	declarations = make(map[ProviderName]Provider)
 )
 
-// Register 添加一个提供者到全局注册表
+// Register retains the legacy declaration entry point without publishing the
+// provider to business requests. PluginManager is the sole production publisher.
 func Register(p Provider) {
+	Declare(p)
+}
+
+// Declare records a built-in provider without making it available to business requests.
+func Declare(p Provider) {
+	if p == nil {
+		panic("cannot declare nil model provider")
+	}
 	registryMu.Lock()
 	defer registryMu.Unlock()
+	name := p.Info().Name
+	if name == "" {
+		panic("cannot declare model provider with empty name")
+	}
+	if _, exists := declarations[name]; exists {
+		panic(fmt.Sprintf("model provider %q declared twice", name))
+	}
+	declarations[name] = p
+}
+
+// BuiltinProviders returns built-in declarations in the established UI order.
+func BuiltinProviders() []Provider {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	result := make([]Provider, 0, len(declarations))
+	for _, name := range AllProviders() {
+		if provider, exists := declarations[name]; exists {
+			result = append(result, provider)
+		}
+	}
+	return result
+}
+
+// Publish publishes a declared provider to the business registry.
+func Publish(p Provider) error {
+	if p == nil || p.Info().Name == "" {
+		return fmt.Errorf("model provider name and implementation are required")
+	}
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	if _, exists := registry[p.Info().Name]; exists {
+		return fmt.Errorf("model provider %q already registered", p.Info().Name)
+	}
 	registry[p.Info().Name] = p
+	return nil
+}
+
+func Unregister(name ProviderName) error {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	if _, exists := registry[name]; !exists {
+		return fmt.Errorf("model provider %q not registered", name)
+	}
+	delete(registry, name)
+	return nil
 }
 
 // Get 通过名称从注册表中获取提供者

@@ -2,6 +2,8 @@ package datasource
 
 import (
 	"context"
+	"fmt"
+	"sync"
 
 	"github.com/Tencent/WeKnora/internal/types"
 )
@@ -95,6 +97,7 @@ type StreamingConnector interface {
 
 // ConnectorRegistry manages the registration and lookup of available connectors
 type ConnectorRegistry struct {
+	mu         sync.RWMutex
 	connectors map[string]Connector
 }
 
@@ -113,12 +116,30 @@ func (r *ConnectorRegistry) Register(connector Connector) error {
 	if connector.Type() == "" {
 		return ErrConnectorTypeEmpty
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.connectors[connector.Type()]; exists {
+		return ErrConnectorDuplicate
+	}
 	r.connectors[connector.Type()] = connector
+	return nil
+}
+
+// Unregister removes a connector from new request routing.
+func (r *ConnectorRegistry) Unregister(connectorType string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.connectors[connectorType]; !exists {
+		return ErrConnectorNotFound
+	}
+	delete(r.connectors, connectorType)
 	return nil
 }
 
 // Get retrieves a connector by type
 func (r *ConnectorRegistry) Get(connectorType string) (Connector, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	connector, exists := r.connectors[connectorType]
 	if !exists {
 		return nil, ErrConnectorNotFound
@@ -128,6 +149,8 @@ func (r *ConnectorRegistry) Get(connectorType string) (Connector, error) {
 
 // List returns all registered connector types
 func (r *ConnectorRegistry) List() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	types := make([]string, 0, len(r.connectors))
 	for t := range r.connectors {
 		types = append(types, t)
@@ -287,13 +310,55 @@ var ConnectorMetadataRegistry = map[string]ConnectorMetadata{
 	},
 }
 
+var (
+	connectorMetadataMu     sync.RWMutex
+	activeConnectorMetadata = make(map[string]ConnectorMetadata)
+)
+
+// PublishConnectorMetadata exposes declared UI metadata only after the matching
+// connector has been published by the plugin control plane.
+func PublishConnectorMetadata(connectorType string) error {
+	metadata, declared := ConnectorMetadataRegistry[connectorType]
+	if !declared {
+		return fmt.Errorf("connector metadata %q is not declared", connectorType)
+	}
+	metadata.Capabilities = append([]string(nil), metadata.Capabilities...)
+	connectorMetadataMu.Lock()
+	defer connectorMetadataMu.Unlock()
+	if _, exists := activeConnectorMetadata[connectorType]; exists {
+		return fmt.Errorf("connector metadata %q already published", connectorType)
+	}
+	activeConnectorMetadata[connectorType] = metadata
+	return nil
+}
+
+func UnpublishConnectorMetadata(connectorType string) error {
+	connectorMetadataMu.Lock()
+	defer connectorMetadataMu.Unlock()
+	if _, exists := activeConnectorMetadata[connectorType]; !exists {
+		return fmt.Errorf("connector metadata %q not published", connectorType)
+	}
+	delete(activeConnectorMetadata, connectorType)
+	return nil
+}
+
+func IsConnectorMetadataPublished(connectorType string) bool {
+	connectorMetadataMu.RLock()
+	defer connectorMetadataMu.RUnlock()
+	_, exists := activeConnectorMetadata[connectorType]
+	return exists
+}
+
 // ListAvailableConnectors returns all available connector metadata
 // sorted by priority
 func ListAvailableConnectors() []ConnectorMetadata {
-	metadata := make([]ConnectorMetadata, 0, len(ConnectorMetadataRegistry))
-	for _, meta := range ConnectorMetadataRegistry {
+	connectorMetadataMu.RLock()
+	metadata := make([]ConnectorMetadata, 0, len(activeConnectorMetadata))
+	for _, meta := range activeConnectorMetadata {
+		meta.Capabilities = append([]string(nil), meta.Capabilities...)
 		metadata = append(metadata, meta)
 	}
+	connectorMetadataMu.RUnlock()
 
 	// Sort by priority (insertion sort for simplicity)
 	for i := 1; i < len(metadata); i++ {

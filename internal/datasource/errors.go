@@ -12,6 +12,7 @@ var (
 	ErrConnectorNil       = errors.New("connector is nil")
 	ErrConnectorTypeEmpty = errors.New("connector type is empty")
 	ErrConnectorNotFound  = errors.New("connector type not found in registry")
+	ErrConnectorDuplicate = errors.New("connector type already registered")
 
 	// DataSource errors
 	ErrDataSourceNotFound  = errors.New("data source not found")

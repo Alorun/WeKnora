@@ -19,6 +19,10 @@ var versionedSQLiteTables = []string{
 	"system_settings",
 	"knowledge_processing_spans",
 	"knowledge_tag_relations",
+	"plugin_installations",
+	"datasource_plugin_bindings",
+	"directory_grants",
+	"datasource_plugin_revisions",
 }
 
 // versionedSQLiteColumns maps each existing table to the columns that the
@@ -33,7 +37,7 @@ var versionedSQLiteColumns = map[string][]string{
 	"mcp_oauth_tokens":   {"principal_type", "principal_id"}, // 000064
 }
 
-const expectedSQLiteMigrationVersion = 12
+const expectedSQLiteMigrationVersion = 13
 
 func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	repoRoot := sqliteRepoRoot(t)
