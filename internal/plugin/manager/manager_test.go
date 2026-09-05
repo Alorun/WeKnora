@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
@@ -13,6 +14,9 @@ import (
 	"github.com/Tencent/WeKnora/internal/plugin/builtin"
 	"github.com/Tencent/WeKnora/internal/plugin/catalog"
 	"github.com/Tencent/WeKnora/internal/plugin/control"
+	pluginruntime "github.com/Tencent/WeKnora/internal/plugin/runtime"
+	pluginv1 "github.com/Tencent/WeKnora/pkg/plugin/proto/v1"
+	"github.com/stretchr/testify/require"
 )
 
 type fakeRegistrar struct {
@@ -201,6 +205,14 @@ func (s *memoryExternalStore) GetInstallation(_ context.Context, id string) (*co
 	copy := *value
 	return &copy, nil
 }
+func (s *memoryExternalStore) GetBinding(_ context.Context, dataSourceID string) (*control.DataSourcePluginBinding, error) {
+	value, exists := s.bindings[dataSourceID]
+	if !exists {
+		return nil, errors.New("not found")
+	}
+	copy := *value
+	return &copy, nil
+}
 func (s *memoryExternalStore) UpdateInstallationState(_ context.Context, id string, enabled bool, status, lastError string) error {
 	value := s.installations[id]
 	value.Enabled, value.InstallStatus, value.LastError = enabled, status, lastError
@@ -253,4 +265,106 @@ func externalManifest() control.Manifest {
 			ConfigSchema: map[string]any{"type": "object", "additionalProperties": false},
 		},
 	}
+}
+
+type managerRuntimeHandle struct {
+	id         string
+	dsID       string
+	generation uint64
+}
+
+func (h *managerRuntimeHandle) InstanceID() string   { return h.id }
+func (h *managerRuntimeHandle) DataSourceID() string { return h.dsID }
+func (h *managerRuntimeHandle) Generation() uint64   { return h.generation }
+func (h *managerRuntimeHandle) BackendInstance() pluginruntime.BackendInstance {
+	return pluginruntime.BackendInstance{ID: h.id}
+}
+func (h *managerRuntimeHandle) ControlClient() pluginv1.PluginControlClient { return nil }
+func (h *managerRuntimeHandle) DataSourceClient() pluginv1.DataSourcePluginClient {
+	return nil
+}
+
+type managerRuntime struct {
+	startErr error
+	stopErr  error
+}
+
+func (r managerRuntime) Start(_ context.Context, spec pluginruntime.InstanceSpec) (pluginruntime.RuntimeHandle, error) {
+	if r.startErr != nil {
+		return nil, r.startErr
+	}
+	return &managerRuntimeHandle{id: "runtime-handle", dsID: spec.DataSourceID, generation: spec.Generation}, nil
+}
+func (managerRuntime) Health(context.Context, pluginruntime.RuntimeHandle) (pluginruntime.HealthResult, error) {
+	return pluginruntime.HealthResult{Status: pluginv1.HealthStatus_HEALTH_STATUS_READY}, nil
+}
+func (r managerRuntime) Stop(context.Context, pluginruntime.RuntimeHandle, time.Duration) error {
+	return r.stopErr
+}
+
+func TestExternalPluginBecomesReadyOnlyAfterRuntimeStartReturns(t *testing.T) {
+	store := &memoryExternalStore{installations: map[string]*control.PluginInstallation{
+		"installation-1": {ID: "installation-1", PluginID: "community.local-files", Version: "0.1.0", Active: true},
+	}, bindings: map[string]*control.DataSourcePluginBinding{
+		"ds-1": {DataSourceID: "ds-1", InstallationID: "installation-1", ExtensionID: "local", Generation: 1},
+	}}
+	manager := NewWithRuntime(catalog.New(), store, "", managerRuntime{})
+	manager.statuses["community.local-files"] = control.PluginStatus{PluginID: "community.local-files", State: control.StateStopped}
+	require.NoError(t, manager.EnableExternal(context.Background(), "installation-1"))
+	status, err := manager.Status("community.local-files")
+	require.NoError(t, err)
+	require.Equal(t, control.StateStarting, status.State)
+	handle, err := manager.StartExternal(context.Background(), "installation-1", pluginruntime.InstanceSpec{
+		PluginID: "community.local-files", PluginVersion: "0.1.0", ExtensionID: "local", DataSourceID: "ds-1", Generation: 1,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, handle)
+	status, err = manager.Status("community.local-files")
+	require.NoError(t, err)
+	require.Equal(t, control.StateReady, status.State)
+}
+
+func TestExternalRuntimeRejectsMissingBinding(t *testing.T) {
+	store := &memoryExternalStore{installations: map[string]*control.PluginInstallation{
+		"installation-1": {ID: "installation-1", PluginID: "community.local-files", Version: "0.1.0", Active: true},
+	}, bindings: map[string]*control.DataSourcePluginBinding{}}
+	manager := NewWithRuntime(catalog.New(), store, "", managerRuntime{})
+	_, err := manager.StartExternal(context.Background(), "installation-1", pluginruntime.InstanceSpec{
+		PluginID: "community.local-files", PluginVersion: "0.1.0", ExtensionID: "local", DataSourceID: "ds-unbound", Generation: 1,
+	})
+	require.ErrorContains(t, err, "load datasource plugin binding")
+}
+
+func TestExternalRuntimeFailureKeepsDesiredEnabledForReconcile(t *testing.T) {
+	store := &memoryExternalStore{installations: map[string]*control.PluginInstallation{
+		"installation-1": {ID: "installation-1", PluginID: "community.local-files", Version: "0.1.0", Active: true, Enabled: true},
+	}, bindings: map[string]*control.DataSourcePluginBinding{
+		"ds-1": {DataSourceID: "ds-1", InstallationID: "installation-1", ExtensionID: "local", Generation: 1},
+	}}
+	manager := NewWithRuntime(catalog.New(), store, "", managerRuntime{startErr: errors.New("health not ready")})
+	manager.statuses["community.local-files"] = control.PluginStatus{PluginID: "community.local-files", State: control.StateStarting}
+	_, err := manager.StartExternal(context.Background(), "installation-1", pluginruntime.InstanceSpec{
+		PluginID: "community.local-files", PluginVersion: "0.1.0", ExtensionID: "local", DataSourceID: "ds-1", Generation: 1,
+	})
+	require.ErrorContains(t, err, "health not ready")
+	require.True(t, store.installations["installation-1"].Enabled)
+	status, statusErr := manager.Status("community.local-files")
+	require.NoError(t, statusErr)
+	require.Equal(t, control.StateNotReady, status.State)
+}
+
+func TestExternalStopFailureDoesNotRetainUnroutableHandle(t *testing.T) {
+	store := &memoryExternalStore{installations: map[string]*control.PluginInstallation{
+		"installation-1": {ID: "installation-1", PluginID: "community.local-files", Version: "0.1.0", Active: true, Enabled: true},
+	}, bindings: map[string]*control.DataSourcePluginBinding{
+		"ds-1": {DataSourceID: "ds-1", InstallationID: "installation-1", ExtensionID: "local", Generation: 1},
+	}}
+	manager := NewWithRuntime(catalog.New(), store, "", managerRuntime{stopErr: errors.New("backend cleanup failed")})
+	manager.statuses["community.local-files"] = control.PluginStatus{PluginID: "community.local-files", State: control.StateStarting}
+	spec := pluginruntime.InstanceSpec{PluginID: "community.local-files", PluginVersion: "0.1.0", ExtensionID: "local", DataSourceID: "ds-1", Generation: 1}
+	_, err := manager.StartExternal(context.Background(), "installation-1", spec)
+	require.NoError(t, err)
+	require.ErrorContains(t, manager.StopExternal(context.Background(), "installation-1", "ds-1", time.Second), "backend cleanup failed")
+	_, err = manager.StartExternal(context.Background(), "installation-1", spec)
+	require.NoError(t, err, "cleanup failure retained an unroutable manager handle")
 }

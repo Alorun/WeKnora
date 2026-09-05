@@ -80,6 +80,22 @@ func TestFinalizeIndexedKnowledgeState(t *testing.T) {
 	}
 }
 
+func TestFinalizeIndexedPluginRevisionRemainsHiddenUntilLedgerPromotion(t *testing.T) {
+	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	knowledge := &types.Knowledge{
+		ParseStatus:  types.ParseStatusProcessing,
+		EnableStatus: "disabled",
+		Metadata:     types.JSON(`{"plugin_revision_state":"pending"}`),
+	}
+	finalizeIndexedKnowledgeState(knowledge, 4096, 0, false, now)
+	if knowledge.ParseStatus != types.ParseStatusCompleted {
+		t.Fatalf("ParseStatus = %q, want completed", knowledge.ParseStatus)
+	}
+	if knowledge.EnableStatus != "disabled" {
+		t.Fatalf("EnableStatus = %q, want disabled until revision activation", knowledge.EnableStatus)
+	}
+}
+
 // TestMarkKnowledgeProcessingClearsPreviousAttemptError covers the transition
 // every worker performs before it starts a new attempt. A row that failed
 // earlier still carries that attempt's error_message, and leaving it in place

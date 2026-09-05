@@ -3,9 +3,12 @@
 package datasource
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
+
+	pluginv1 "github.com/Tencent/WeKnora/pkg/plugin/proto/v1"
 )
 
 var (
@@ -13,10 +16,14 @@ var (
 	ErrStaleGeneration = errors.New("stale connector handle generation")
 )
 
-// Handle is deliberately capability-neutral until the datasource gRPC contract
-// is defined in Phase B.
 type Handle interface {
 	InstanceID() string
+}
+
+type RPCHandle interface {
+	Handle
+	ControlClient() pluginv1.PluginControlClient
+	DataSourceClient() pluginv1.DataSourcePluginClient
 }
 
 type ResolvedHandle struct {
@@ -26,11 +33,30 @@ type ResolvedHandle struct {
 
 type Resolver struct {
 	mu      sync.RWMutex
-	handles map[string]ResolvedHandle
+	handles map[string]*entry
 }
 
 func NewResolver() *Resolver {
-	return &Resolver{handles: make(map[string]ResolvedHandle)}
+	return &Resolver{handles: make(map[string]*entry)}
+}
+
+type entry struct {
+	resolved ResolvedHandle
+	inflight int
+	drained  chan struct{}
+	closed   bool
+}
+
+type Lease struct {
+	ResolvedHandle
+	release func()
+	once    sync.Once
+}
+
+func (l *Lease) Release() {
+	if l != nil {
+		l.once.Do(l.release)
+	}
 }
 
 func (r *Resolver) Publish(dataSourceID string, generation uint64, handle Handle) error {
@@ -40,16 +66,22 @@ func (r *Resolver) Publish(dataSourceID string, generation uint64, handle Handle
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current, exists := r.handles[dataSourceID]
-	if exists && generation < current.Generation {
-		return fmt.Errorf("data source %s generation %d is older than %d: %w", dataSourceID, generation, current.Generation, ErrStaleGeneration)
+	if exists && generation < current.resolved.Generation {
+		return fmt.Errorf("data source %s generation %d is older than %d: %w", dataSourceID, generation, current.resolved.Generation, ErrStaleGeneration)
 	}
-	if exists && generation == current.Generation {
-		if current.Handle.InstanceID() == handle.InstanceID() {
+	if exists && generation == current.resolved.Generation {
+		if current.resolved.Handle.InstanceID() == handle.InstanceID() {
 			return nil
 		}
-		return fmt.Errorf("data source %s generation %d is already published by %s", dataSourceID, generation, current.Handle.InstanceID())
+		return fmt.Errorf("data source %s generation %d is already published by %s", dataSourceID, generation, current.resolved.Handle.InstanceID())
 	}
-	r.handles[dataSourceID] = ResolvedHandle{Handle: handle, Generation: generation}
+	if exists {
+		r.closeEntryLocked(current)
+	}
+	r.handles[dataSourceID] = &entry{
+		resolved: ResolvedHandle{Handle: handle, Generation: generation},
+		drained:  make(chan struct{}),
+	}
 	return nil
 }
 
@@ -60,24 +92,85 @@ func (r *Resolver) Resolve(dataSourceID string) (ResolvedHandle, error) {
 	if !exists {
 		return ResolvedHandle{}, fmt.Errorf("data source %s: %w", dataSourceID, ErrHandleNotFound)
 	}
-	return handle, nil
+	return handle.resolved, nil
+}
+
+// Acquire pins a published handle for one business call. Unpublish removes it
+// from new routing immediately; Drain then waits only for leases acquired
+// before removal.
+func (r *Resolver) Acquire(dataSourceID string) (*Lease, error) {
+	r.mu.Lock()
+	entry, exists := r.handles[dataSourceID]
+	if !exists || entry.closed {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("data source %s: %w", dataSourceID, ErrHandleNotFound)
+	}
+	entry.inflight++
+	resolved := entry.resolved
+	r.mu.Unlock()
+	return &Lease{ResolvedHandle: resolved, release: func() { r.release(entry) }}, nil
 }
 
 // Unpublish is generation-conditional so a stale stop cannot remove the new
 // generation. Once it returns, subsequent Resolve calls cannot acquire it.
 func (r *Resolver) Unpublish(dataSourceID string, generation uint64) error {
+	_, err := r.unpublish(dataSourceID, generation)
+	return err
+}
+
+func (r *Resolver) UnpublishAndDrain(ctx context.Context, dataSourceID string, generation uint64) error {
+	drained, err := r.unpublish(dataSourceID, generation)
+	if err != nil || drained == nil {
+		return err
+	}
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *Resolver) unpublish(dataSourceID string, generation uint64) (<-chan struct{}, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current, exists := r.handles[dataSourceID]
 	if !exists {
-		return nil
+		return nil, nil
 	}
-	if generation < current.Generation {
-		return fmt.Errorf("data source %s generation %d is older than %d: %w", dataSourceID, generation, current.Generation, ErrStaleGeneration)
+	if generation < current.resolved.Generation {
+		return nil, fmt.Errorf("data source %s generation %d is older than %d: %w", dataSourceID, generation, current.resolved.Generation, ErrStaleGeneration)
 	}
-	if generation != current.Generation {
-		return fmt.Errorf("data source %s generation %d does not match current %d", dataSourceID, generation, current.Generation)
+	if generation != current.resolved.Generation {
+		return nil, fmt.Errorf("data source %s generation %d does not match current %d", dataSourceID, generation, current.resolved.Generation)
 	}
 	delete(r.handles, dataSourceID)
-	return nil
+	r.closeEntryLocked(current)
+	return current.drained, nil
+}
+
+func (r *Resolver) closeEntryLocked(current *entry) {
+	current.closed = true
+	if current.inflight == 0 {
+		select {
+		case <-current.drained:
+		default:
+			close(current.drained)
+		}
+	}
+}
+
+func (r *Resolver) release(current *entry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if current.inflight > 0 {
+		current.inflight--
+	}
+	if current.closed && current.inflight == 0 {
+		select {
+		case <-current.drained:
+		default:
+			close(current.drained)
+		}
+	}
 }

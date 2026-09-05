@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -35,4 +36,24 @@ func TestSyncTaskExecutorInjectsRetryMetadata(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for sync task")
 	}
+}
+
+func TestSyncTaskExecutorHonorsTaskIDWhileActive(t *testing.T) {
+	executor := NewSyncTaskExecutor()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	executor.RegisterHandler("test:task-id", func(context.Context, *asynq.Task) error {
+		close(started)
+		<-release
+		return nil
+	})
+	task := asynq.NewTask("test:task-id", nil)
+	if _, err := executor.Enqueue(task, asynq.TaskID("stable")); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if _, err := executor.Enqueue(task, asynq.TaskID("stable")); !errors.Is(err, asynq.ErrTaskIDConflict) {
+		t.Fatalf("duplicate task id error = %v", err)
+	}
+	close(release)
 }

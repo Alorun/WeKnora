@@ -77,6 +77,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
 	pluginbuiltin "github.com/Tencent/WeKnora/internal/plugin/builtin"
 	plugincatalog "github.com/Tencent/WeKnora/internal/plugin/catalog"
+	plugindatasource "github.com/Tencent/WeKnora/internal/plugin/datasource"
 	pluginmanager "github.com/Tencent/WeKnora/internal/plugin/manager"
 	pluginstore "github.com/Tencent/WeKnora/internal/plugin/store"
 	"github.com/Tencent/WeKnora/internal/router"
@@ -251,6 +252,11 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(plugincatalog.New))
 	must(container.Provide(pluginstore.New))
 	must(container.Provide(func(store *pluginstore.Store) pluginmanager.ExternalStore { return store }))
+	must(container.Provide(func(store *pluginstore.Store) plugindatasource.BindingStore { return store }))
+	must(container.Provide(func(store *pluginstore.Store) plugindatasource.RevisionStore { return store }))
+	must(container.Provide(plugindatasource.NewResolver))
+	must(container.Provide(plugindatasource.NewConnectorRouter))
+	must(container.Provide(plugindatasource.NewRevisionProcessor))
 	must(container.Provide(newPluginManager))
 	must(container.Invoke(startBuiltinPluginControlPlane))
 	must(container.Provide(repository.NewWebSearchProviderRepository))
@@ -324,6 +330,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 		must(container.Provide(router.NewMaintenanceAsynqServer, dig.Name("maintenanceAsynqServer")))
 		must(container.Provide(router.NewSharedAsynqServer, dig.Name("sharedAsynqServer")))
 		must(container.Provide(router.NewWikiAsynqServer, dig.Name("wikiAsynqServer")))
+		must(container.Provide(router.NewPluginAsynqServer, dig.Name("pluginAsynqServer")))
 		// Asynq inspector for cancel-by-knowledge-id (best-effort
 		// dequeue of pending/scheduled/retry tasks + active-task cancel).
 		must(container.Provide(router.NewAsynqInspector))
@@ -354,6 +361,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	logger.Debugf(ctx, "[Container] Registering data source sync framework...")
 	must(container.Provide(datasource.NewScheduler))
 	must(container.Provide(service.NewDataSourceService))
+	must(container.Invoke(wireExternalDataSourceControlPlane))
 	must(container.Invoke(startDataSourceScheduler))
 	logger.Debugf(ctx, "[Container] Data source sync framework registered")
 	must(container.Invoke(startAuditLogRetention))
@@ -1623,6 +1631,27 @@ func startBuiltinPluginControlPlane(
 	if err := manager.StartAll(context.Background()); err != nil {
 		return fmt.Errorf("start builtin plugin control plane: %w", err)
 	}
+	return nil
+}
+
+func wireExternalDataSourceControlPlane(
+	connectors *datasource.ConnectorRegistry,
+	router *plugindatasource.ConnectorRouter,
+	revisions *plugindatasource.RevisionProcessor,
+	scheduler *datasource.Scheduler,
+	dataSourceService interfaces.DataSourceService,
+) error {
+	if err := connectors.SetExternalResolver(router); err != nil {
+		return err
+	}
+	scheduler.SetConnectorRegistry(connectors)
+	configurable, ok := dataSourceService.(interface {
+		SetExternalRevisionIngestor(datasource.ExternalRevisionIngestor)
+	})
+	if !ok {
+		return fmt.Errorf("data source service does not support external revision ingestion")
+	}
+	configurable.SetExternalRevisionIngestor(revisions)
 	return nil
 }
 

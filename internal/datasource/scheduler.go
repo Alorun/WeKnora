@@ -29,9 +29,14 @@ type Scheduler struct {
 	dsRepo       interfaces.DataSourceRepository
 	syncLogRepo  interfaces.SyncLogRepository
 	taskEnqueuer interfaces.TaskEnqueuer
+	connectors   *ConnectorRegistry
 
 	mu      sync.Mutex
 	entries map[string]cron.EntryID // dataSourceID → cron entry ID
+}
+
+func (s *Scheduler) SetConnectorRegistry(connectors *ConnectorRegistry) {
+	s.connectors = connectors
 }
 
 // NewScheduler creates a new Scheduler.
@@ -172,13 +177,24 @@ func (s *Scheduler) triggerSync(dataSourceID string, tenantID uint64) {
 	}
 	langfuse.InjectTracing(ctx, payload)
 	payloadJSON, _ := json.Marshal(payload)
-	task := asynq.NewTask(types.TypeDataSourceSync, payloadJSON)
+	taskType := types.TypeDataSourceSync
+	queue := types.QueueSync
+	if s.connectors != nil {
+		if external, routeErr := s.connectors.HasExternalBinding(ctx, dataSourceID); routeErr != nil {
+			logger.Errorf(ctx, "[Scheduler] failed to route sync for ds=%s: %v", dataSourceID, routeErr)
+			return
+		} else if external {
+			taskType = types.TypePluginDataSourceSync
+			queue = types.QueuePlugin
+		}
+	}
+	task := asynq.NewTask(taskType, payloadJSON)
 
 	// Layer 2: deterministic TaskID — all instances in the same minute produce the same ID
 	taskID := fmt.Sprintf("dssync:%s:%s", dataSourceID, time.Now().UTC().Truncate(time.Minute).Format("200601021504"))
 
 	_, err = s.taskEnqueuer.Enqueue(task,
-		asynq.Queue(types.QueueSync),
+		asynq.Queue(queue),
 		asynq.MaxRetry(5),
 		asynq.Timeout(2*time.Hour),
 		asynq.TaskID(taskID),

@@ -2,6 +2,7 @@ package datasource
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -99,6 +100,36 @@ type StreamingConnector interface {
 type ConnectorRegistry struct {
 	mu         sync.RWMutex
 	connectors map[string]Connector
+	external   ExternalConnectorResolver
+}
+
+// ExternalConnectorResolver is the one instance-aware seam in the legacy
+// registry. handled=false means no Binding exists and preserves the ds.Type
+// lookup path; handled=true with an error must not fall back to a builtin.
+type ExternalConnectorResolver interface {
+	ResolveExternal(context.Context, *types.DataSource) (connector Connector, handled bool, err error)
+	HasExternalBinding(context.Context, string) (bool, error)
+}
+
+// ExternalConnector marks an adapter whose stream must use the revision-aware
+// ingestion path rather than the legacy delete-before-create path.
+type ExternalConnector interface {
+	Connector
+	IsExternal() bool
+}
+
+type ExternalIngestResult struct {
+	Created bool
+	Updated bool
+	Deleted bool
+	Skipped bool
+}
+
+// ExternalRevisionIngestor is implemented by the plugin revision processor.
+// The application service owns sync accounting while the processor owns only
+// durable revision acceptance and idempotency.
+type ExternalRevisionIngestor interface {
+	AcceptExternalItem(context.Context, *types.DataSource, types.FetchedItem, []string) (ExternalIngestResult, error)
 }
 
 // NewConnectorRegistry creates a new connector registry
@@ -123,6 +154,51 @@ func (r *ConnectorRegistry) Register(connector Connector) error {
 	}
 	r.connectors[connector.Type()] = connector
 	return nil
+}
+
+// SetExternalResolver installs the Binding-aware routing seam. It is separate
+// from Register because external instances are per DataSource and must never be
+// placed in the global connector map.
+func (r *ConnectorRegistry) SetExternalResolver(resolver ExternalConnectorResolver) error {
+	if resolver == nil {
+		return errors.New("external connector resolver is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.external != nil && r.external != resolver {
+		return errors.New("external connector resolver is already configured")
+	}
+	r.external = resolver
+	return nil
+}
+
+// ResolveConnector first checks a DataSource Binding, then falls back to the
+// unchanged builtin type registry. A bound-but-stopped plugin therefore fails
+// closed instead of accidentally invoking a builtin with the same type.
+func (r *ConnectorRegistry) ResolveConnector(ctx context.Context, ds *types.DataSource) (Connector, error) {
+	if ds == nil {
+		return nil, ErrDataSourceInvalid
+	}
+	r.mu.RLock()
+	external := r.external
+	r.mu.RUnlock()
+	if external != nil {
+		connector, handled, err := external.ResolveExternal(ctx, ds)
+		if handled || err != nil {
+			return connector, err
+		}
+	}
+	return r.Get(ds.Type)
+}
+
+func (r *ConnectorRegistry) HasExternalBinding(ctx context.Context, dataSourceID string) (bool, error) {
+	r.mu.RLock()
+	external := r.external
+	r.mu.RUnlock()
+	if external == nil {
+		return false, nil
+	}
+	return external.HasExternalBinding(ctx, dataSourceID)
 }
 
 // Unregister removes a connector from new request routing.

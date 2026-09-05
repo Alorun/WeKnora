@@ -195,7 +195,13 @@ func finalizeIndexedKnowledgeState(
 		knowledge.ErrorMessage = ""
 	}
 
-	knowledge.EnableStatus = "enabled"
+	// External plugin revisions remain invisible until the revision ledger
+	// atomically promotes this row and hides the previous active Knowledge.
+	// Builtin connectors and ordinary uploads have no marker and preserve the
+	// existing immediate-enable behavior.
+	if knowledge.GetMetadata()["plugin_revision_state"] != "pending" {
+		knowledge.EnableStatus = "enabled"
+	}
 	knowledge.StorageSize = totalStorageSize
 	knowledge.ProcessedAt = &now
 	knowledge.UpdatedAt = now

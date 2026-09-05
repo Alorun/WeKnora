@@ -12,6 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/plugin/builtin"
 	"github.com/Tencent/WeKnora/internal/plugin/catalog"
 	"github.com/Tencent/WeKnora/internal/plugin/control"
+	pluginruntime "github.com/Tencent/WeKnora/internal/plugin/runtime"
 )
 
 var (
@@ -24,6 +25,7 @@ type ExternalStore interface {
 	CreateInstallation(context.Context, *control.PluginInstallation) error
 	CreateBinding(context.Context, *control.DataSourcePluginBinding) error
 	GetInstallation(context.Context, string) (*control.PluginInstallation, error)
+	GetBinding(context.Context, string) (*control.DataSourcePluginBinding, error)
 	UpdateInstallationState(context.Context, string, bool, string, string) error
 }
 
@@ -34,13 +36,16 @@ type managedBuiltin struct {
 }
 
 type PluginManager struct {
-	mu          sync.Mutex
-	catalog     *catalog.Catalog
-	external    ExternalStore
-	builtins    map[control.PluginID]*managedBuiltin
-	statuses    map[control.PluginID]control.PluginStatus
-	hostVersion string
-	now         func() time.Time
+	mu                  sync.Mutex
+	catalog             *catalog.Catalog
+	external            ExternalStore
+	builtins            map[control.PluginID]*managedBuiltin
+	statuses            map[control.PluginID]control.PluginStatus
+	hostVersion         string
+	now                 func() time.Time
+	runtime             pluginruntime.Runtime
+	handles             map[string]pluginruntime.RuntimeHandle
+	handleInstallations map[string]string
 }
 
 func New(pluginCatalog *catalog.Catalog, external ExternalStore) *PluginManager {
@@ -49,13 +54,23 @@ func New(pluginCatalog *catalog.Catalog, external ExternalStore) *PluginManager 
 
 func NewWithVersion(pluginCatalog *catalog.Catalog, external ExternalStore, hostVersion string) *PluginManager {
 	return &PluginManager{
-		catalog:     pluginCatalog,
-		external:    external,
-		builtins:    make(map[control.PluginID]*managedBuiltin),
-		statuses:    make(map[control.PluginID]control.PluginStatus),
-		hostVersion: hostVersion,
-		now:         time.Now,
+		catalog:             pluginCatalog,
+		external:            external,
+		builtins:            make(map[control.PluginID]*managedBuiltin),
+		statuses:            make(map[control.PluginID]control.PluginStatus),
+		hostVersion:         hostVersion,
+		now:                 time.Now,
+		handles:             make(map[string]pluginruntime.RuntimeHandle),
+		handleInstallations: make(map[string]string),
 	}
+}
+
+func NewWithRuntime(
+	pluginCatalog *catalog.Catalog, external ExternalStore, hostVersion string, runtime pluginruntime.Runtime,
+) *PluginManager {
+	manager := NewWithVersion(pluginCatalog, external, hostVersion)
+	manager.runtime = runtime
+	return manager
 }
 
 func (m *PluginManager) LoadBuiltins(descriptors []builtin.BuiltinDescriptor) error {
@@ -303,6 +318,11 @@ func (m *PluginManager) EnableExternal(ctx context.Context, installationID strin
 		return err
 	}
 	pluginID := installation.PluginID
+	if m.runtime != nil {
+		status := control.PluginStatus{PluginID: pluginID, State: control.StateStarting, UpdatedAt: m.now()}
+		m.statuses[pluginID] = status
+		return m.external.UpdateInstallationState(ctx, installationID, true, control.InstallStatusInstalled, "")
+	}
 	status := control.PluginStatus{
 		PluginID: pluginID, State: control.StateNotReady,
 		LastError: ErrRuntimeNotAvailable.Error(), UpdatedAt: m.now(),
@@ -312,6 +332,136 @@ func (m *PluginManager) EnableExternal(ctx context.Context, installationID strin
 		return err
 	}
 	return ErrRuntimeNotAvailable
+}
+
+// StartExternal is the Phase-B explicit-spec entry point used by the single
+// controller Reconciler. Runtime.Start performs Handshake, validation, health,
+// and final Resolver publication before this method can mark READY.
+func (m *PluginManager) StartExternal(
+	ctx context.Context, installationID string, spec pluginruntime.InstanceSpec,
+) (pluginruntime.RuntimeHandle, error) {
+	m.mu.Lock()
+	if m.external == nil {
+		m.mu.Unlock()
+		return nil, errors.New("external plugin store is not configured")
+	}
+	if m.runtime == nil {
+		m.mu.Unlock()
+		_ = m.EnableExternal(ctx, installationID)
+		return nil, ErrRuntimeNotAvailable
+	}
+	installation, err := m.external.GetInstallation(ctx, installationID)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	if string(installation.PluginID) != spec.PluginID || installation.Version != spec.PluginVersion {
+		m.mu.Unlock()
+		return nil, errors.New("runtime spec does not match installation")
+	}
+	binding, err := m.external.GetBinding(ctx, spec.DataSourceID)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("load datasource plugin binding: %w", err)
+	}
+	if binding.InstallationID != installationID || string(binding.ExtensionID) != spec.ExtensionID ||
+		binding.Generation != spec.Generation {
+		m.mu.Unlock()
+		return nil, errors.New("runtime spec does not match datasource plugin binding")
+	}
+	if existing := m.handles[spec.DataSourceID]; existing != nil {
+		if existing.Generation() == spec.Generation {
+			m.mu.Unlock()
+			return existing, nil
+		}
+		m.mu.Unlock()
+		return nil, errors.New("a different generation is already running")
+	}
+	m.statuses[installation.PluginID] = control.PluginStatus{
+		PluginID: installation.PluginID, State: control.StateStarting, UpdatedAt: m.now(),
+	}
+	m.mu.Unlock()
+
+	handle, startErr := m.runtime.Start(ctx, spec)
+	if startErr != nil {
+		m.mu.Lock()
+		m.statuses[installation.PluginID] = control.PluginStatus{
+			PluginID: installation.PluginID, State: control.StateNotReady, LastError: startErr.Error(), UpdatedAt: m.now(),
+		}
+		m.mu.Unlock()
+		// A transient runtime failure changes observed state, not the user's
+		// desired enabled state. Keeping it enabled lets the single controller
+		// perform its bounded restart on the next reconciliation pass.
+		_ = m.external.UpdateInstallationState(ctx, installationID, true, control.InstallStatusInstalled, startErr.Error())
+		return nil, startErr
+	}
+	if err := m.external.UpdateInstallationState(ctx, installationID, true, control.InstallStatusInstalled, ""); err != nil {
+		_ = m.runtime.Stop(context.WithoutCancel(ctx), handle, 0)
+		m.mu.Lock()
+		m.statuses[installation.PluginID] = control.PluginStatus{
+			PluginID: installation.PluginID, State: control.StateNotReady, LastError: err.Error(), UpdatedAt: m.now(),
+		}
+		m.mu.Unlock()
+		return nil, err
+	}
+	m.mu.Lock()
+	m.handles[spec.DataSourceID] = handle
+	m.handleInstallations[spec.DataSourceID] = installationID
+	m.statuses[installation.PluginID] = control.PluginStatus{
+		PluginID: installation.PluginID, State: control.StateReady, UpdatedAt: m.now(),
+	}
+	m.mu.Unlock()
+	return handle, nil
+}
+
+func (m *PluginManager) StopExternal(
+	ctx context.Context, installationID, dataSourceID string, grace time.Duration,
+) error {
+	m.mu.Lock()
+	if m.runtime == nil {
+		m.mu.Unlock()
+		return ErrRuntimeNotAvailable
+	}
+	if m.external == nil {
+		m.mu.Unlock()
+		return errors.New("external plugin store is not configured")
+	}
+	handle := m.handles[dataSourceID]
+	installation, err := m.external.GetInstallation(ctx, installationID)
+	m.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if handle == nil {
+		return nil
+	}
+	stopErr := m.runtime.Stop(ctx, handle, grace)
+	// Runtime.Stop always removes the Resolver route before attempting graceful
+	// shutdown and backend cleanup. Drop the manager's in-memory handle even
+	// when a later cleanup step fails, otherwise a reconciliation retry could
+	// mistake an unroutable, partially-stopped handle for a running instance.
+	m.mu.Lock()
+	delete(m.handles, dataSourceID)
+	delete(m.handleInstallations, dataSourceID)
+	if stopErr != nil {
+		m.statuses[installation.PluginID] = control.PluginStatus{
+			PluginID: installation.PluginID, State: control.StateFailed, LastError: stopErr.Error(), UpdatedAt: m.now(),
+		}
+		m.mu.Unlock()
+		return stopErr
+	}
+	nextState := control.StateStopped
+	for runningDataSourceID := range m.handles {
+		if m.handleInstallations[runningDataSourceID] == installationID {
+			nextState = control.StateReady
+			break
+		}
+	}
+	m.statuses[installation.PluginID] = control.PluginStatus{
+		PluginID: installation.PluginID, State: nextState, UpdatedAt: m.now(),
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *PluginManager) builtinIDs() []control.PluginID {

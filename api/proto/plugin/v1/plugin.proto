@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package weknora.plugin.v1;
+
+option go_package = "github.com/Tencent/WeKnora/pkg/plugin/proto/v1;pluginv1";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+service PluginControl {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Shutdown(ShutdownRequest) returns (google.protobuf.Empty);
+}
+
+service DataSourcePlugin {
+  rpc ListResources(ListResourcesRequest) returns (ListResourcesResponse);
+  rpc ResolveAncestors(ResolveAncestorsRequest) returns (ResolveAncestorsResponse);
+  rpc Sync(SyncRequest) returns (stream SyncEvent);
+}
+
+enum ExtensionType {
+  EXTENSION_TYPE_UNSPECIFIED = 0;
+  EXTENSION_TYPE_DATASOURCE = 1;
+}
+
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTH_STATUS_READY = 1;
+  HEALTH_STATUS_DEGRADED = 2;
+  HEALTH_STATUS_NOT_READY = 3;
+}
+
+message PluginError {
+  string code = 1;
+  string safe_message = 2;
+}
+
+message HandshakeRequest {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  string extension_id = 3;
+  ExtensionType extension_type = 4;
+  string protocol_version = 5;
+  string contract_version = 6;
+  bytes startup_nonce = 7;
+  repeated string required_capabilities = 8;
+}
+
+message HandshakeResponse {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  string extension_id = 3;
+  ExtensionType extension_type = 4;
+  string protocol_version = 5;
+  string contract_version = 6;
+  bytes startup_nonce = 7;
+  repeated string supported_capabilities = 8;
+  PluginError error = 9;
+}
+
+message ValidateConfigRequest {
+  bytes config_json = 1;
+}
+
+message ValidateConfigResponse {
+  PluginError error = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  HealthStatus status = 1;
+  PluginError error = 2;
+  google.protobuf.Timestamp checked_at = 3;
+}
+
+message ShutdownRequest {
+  int64 grace_millis = 1;
+}
+
+message ListResourcesRequest {
+  bytes config_json = 1;
+  string parent_id = 2;
+}
+
+message ListResourcesResponse {
+  repeated Resource resources = 1;
+  PluginError error = 2;
+}
+
+message Resource {
+  string external_id = 1;
+  string name = 2;
+  string type = 3;
+  string description = 4;
+  string url = 5;
+  google.protobuf.Timestamp modified_at = 6;
+  string parent_id = 7;
+  bool has_children = 8;
+  bytes metadata_json = 9;
+}
+
+message ResolveAncestorsRequest {
+  bytes config_json = 1;
+  repeated string resource_ids = 2;
+}
+
+message ResolveAncestorsResponse {
+  repeated string ancestor_ids = 1;
+  PluginError error = 2;
+}
+
+message SyncRequest {
+  bytes config_json = 1;
+  bytes cursor_json = 2;
+  bool force_full = 3;
+  bool multimodal_enabled = 4;
+}
+
+message SyncEvent {
+  oneof event {
+    DocumentUpsert upsert = 1;
+    DocumentDelete delete = 2;
+    ItemError item_error = 3;
+    Checkpoint checkpoint = 4;
+  }
+}
+
+message DocumentUpsert {
+  string external_id = 1;
+  string revision = 2;
+  string title = 3;
+  bytes content = 4;
+  string content_type = 5;
+  string file_name = 6;
+  string url = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  map<string, string> metadata = 9;
+  string source_resource_id = 10;
+  bool replaces_subtree = 11;
+  repeated string subtree_keep = 12;
+}
+
+message DocumentDelete {
+  string external_id = 1;
+  string title = 2;
+}
+
+message ItemError {
+  string external_id = 1;
+  string code = 2;
+  string safe_message = 3;
+}
+
+message Checkpoint {
+  bytes cursor_json = 1;
+}

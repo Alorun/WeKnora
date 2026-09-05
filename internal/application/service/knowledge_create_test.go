@@ -21,6 +21,8 @@ type createKnowledgeFileRepoStub struct {
 	createCalls      int
 	createErr        error
 	createdKnowledge *types.Knowledge
+	duplicateChecks  int
+	duplicate        *types.Knowledge
 }
 
 func (r *createKnowledgeFileRepoStub) CheckKnowledgeExists(
@@ -29,7 +31,8 @@ func (r *createKnowledgeFileRepoStub) CheckKnowledgeExists(
 	kbID string,
 	params *types.KnowledgeCheckParams,
 ) (bool, *types.Knowledge, error) {
-	return false, nil, nil
+	r.duplicateChecks++
+	return r.duplicate != nil, r.duplicate, nil
 }
 
 func (r *createKnowledgeFileRepoStub) CreateKnowledge(ctx context.Context, knowledge *types.Knowledge) error {
@@ -119,6 +122,16 @@ type createKnowledgeTaskEnqueuerStub struct {
 	calls int
 }
 
+type createKnowledgeRevisionPersister struct {
+	created *types.Knowledge
+}
+
+func (p *createKnowledgeRevisionPersister) CreateKnowledge(_ context.Context, knowledge *types.Knowledge) error {
+	copy := *knowledge
+	p.created = &copy
+	return nil
+}
+
 func (s *createKnowledgeTaskEnqueuerStub) Enqueue(
 	task *asynq.Task,
 	opts ...asynq.Option,
@@ -190,6 +203,29 @@ func TestCreateKnowledgeFromFilePersistsStoredFilePathOnCreate(t *testing.T) {
 	require.NotNil(t, repo.createdKnowledge)
 	require.Equal(t, "stored/"+knowledge.ID, repo.createdKnowledge.FilePath)
 	require.Equal(t, 1, task.calls)
+}
+
+func TestCreateKnowledgeFromFileRevisionBypassesGlobalContentDedup(t *testing.T) {
+	repo := &createKnowledgeFileRepoStub{duplicate: &types.Knowledge{ID: "old-active"}}
+	fileSvc := &createKnowledgeFileServiceStub{}
+	task := &createKnowledgeTaskEnqueuerStub{}
+	persister := &createKnowledgeRevisionPersister{}
+	svc := &knowledgeService{
+		repo: repo, kbService: &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{ID: "kb-1"}},
+		fileSvc: fileSvc, task: task,
+	}
+	ctx := interfaces.WithDeferredKnowledgeProcessing(
+		interfaces.WithKnowledgeRecordPersister(newCreateKnowledgeFileContext(), persister),
+	)
+	knowledge, err := svc.CreateKnowledgeFromFile(
+		ctx, "kb-1", newMultipartFileHeader(t, "doc.txt", "same bytes"), nil, nil, "", nil, "", nil,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, knowledge)
+	require.Zero(t, repo.duplicateChecks, "revision identity must replace upload-wide content dedup")
+	require.NotNil(t, persister.created)
+	require.Equal(t, knowledge.ID, persister.created.ID)
+	require.Zero(t, task.calls, "revision processor owns enqueue after its transaction commits")
 }
 
 func TestCreateKnowledgeFromImageFallsBackWhenLegacyStorageConfigIsIncomplete(t *testing.T) {

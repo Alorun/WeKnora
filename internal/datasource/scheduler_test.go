@@ -2,6 +2,7 @@ package datasource
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -148,10 +149,12 @@ func (r *fakeSyncLogRepo) HasRunningSync(_ context.Context, dsID string) (bool, 
 type fakeTaskEnqueuer struct {
 	count     atomic.Int64
 	lastQueue atomic.Value
+	lastType  atomic.Value
 }
 
 func (e *fakeTaskEnqueuer) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
 	e.count.Add(1)
+	e.lastType.Store(task.Type())
 	for _, opt := range opts {
 		if opt.Type() == asynq.QueueOpt {
 			if queue, ok := opt.Value().(string); ok {
@@ -160,6 +163,34 @@ func (e *fakeTaskEnqueuer) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 		}
 	}
 	return &asynq.TaskInfo{ID: "task-fake"}, nil
+}
+
+type schedulerExternalResolver struct{}
+
+func (schedulerExternalResolver) ResolveExternal(context.Context, *types.DataSource) (Connector, bool, error) {
+	return nil, true, errors.New("runtime is not used for queue routing")
+}
+func (schedulerExternalResolver) HasExternalBinding(context.Context, string) (bool, error) {
+	return true, nil
+}
+
+func TestSchedulerExternalDataSourceUsesControllerQueue(t *testing.T) {
+	repo := newFakeDataSourceRepo()
+	_ = repo.Create(context.Background(), &types.DataSource{ID: "ds-plugin", TenantID: 1, Status: types.DataSourceStatusActive})
+	enqueuer := &fakeTaskEnqueuer{}
+	scheduler := NewScheduler(repo, newFakeSyncLogRepo(), enqueuer)
+	registry := NewConnectorRegistry()
+	if err := registry.SetExternalResolver(schedulerExternalResolver{}); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.SetConnectorRegistry(registry)
+	scheduler.triggerSync("ds-plugin", 1)
+	if queue, _ := enqueuer.lastQueue.Load().(string); queue != types.QueuePlugin {
+		t.Fatalf("external sync queue = %q, want %q", queue, types.QueuePlugin)
+	}
+	if taskType, _ := enqueuer.lastType.Load().(string); taskType != types.TypePluginDataSourceSync {
+		t.Fatalf("external sync type = %q, want %q", taskType, types.TypePluginDataSourceSync)
+	}
 }
 
 // ──────────────────────────────────────────────────────────────────────

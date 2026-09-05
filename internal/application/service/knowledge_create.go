@@ -16,6 +16,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -84,28 +85,32 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		return nil, err
 	}
 
-	// Check if file already exists
 	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
-	logger.Infof(ctx, "Checking if file exists, tenant ID: %d", tenantID)
-	exists, existingKnowledge, err := s.repo.CheckKnowledgeExists(ctx, tenantID, kbID, &types.KnowledgeCheckParams{
-		Type:     "file",
-		FileName: fileName,
-		FileType: getFileType(fileName),
-		FileSize: file.Size,
-		FileHash: hash,
-	})
-	if err != nil {
-		logger.Errorf(ctx, "Failed to check knowledge existence: %v", err)
-		return nil, err
-	}
-	if exists {
-		logger.Infof(ctx, "File already exists: %s", fileName)
-		// Update creation time for existing knowledge
-		if err := s.repo.UpdateKnowledgeColumn(ctx, existingKnowledge.ID, "created_at", time.Now()); err != nil {
-			logger.Errorf(ctx, "Failed to update existing knowledge: %v", err)
-			return nil, err
+	// An external revision deliberately creates a second, disabled Knowledge
+	// row even when its bytes are unchanged. The revision ledger, not the
+	// upload-wide content hash, is the idempotency key and keeps the old active
+	// row visible until the new revision completes.
+	if interfaces.KnowledgeRecordPersisterFromContext(ctx) == nil {
+		logger.Infof(ctx, "Checking if file exists, tenant ID: %d", tenantID)
+		exists, existingKnowledge, duplicateErr := s.repo.CheckKnowledgeExists(ctx, tenantID, kbID, &types.KnowledgeCheckParams{
+			Type:     "file",
+			FileName: fileName,
+			FileType: getFileType(fileName),
+			FileSize: file.Size,
+			FileHash: hash,
+		})
+		if duplicateErr != nil {
+			logger.Errorf(ctx, "Failed to check knowledge existence: %v", duplicateErr)
+			return nil, duplicateErr
 		}
-		return existingKnowledge, types.NewDuplicateFileError(existingKnowledge)
+		if exists {
+			logger.Infof(ctx, "File already exists: %s", fileName)
+			if err := s.repo.UpdateKnowledgeColumn(ctx, existingKnowledge.ID, "created_at", time.Now()); err != nil {
+				logger.Errorf(ctx, "Failed to update existing knowledge: %v", err)
+				return nil, err
+			}
+			return existingKnowledge, types.NewDuplicateFileError(existingKnowledge)
+		}
 	}
 
 	// Check storage quota
@@ -190,7 +195,7 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 
 	// Save knowledge record to database after the file is safely stored.
 	logger.Info(ctx, "Saving knowledge record to database")
-	if err := s.repo.CreateKnowledge(ctx, knowledge); err != nil {
+	if err := s.persistNewKnowledge(ctx, knowledge); err != nil {
 		logger.Errorf(ctx, "Failed to create knowledge record, ID: %s, error: %v", knowledge.ID, err)
 		if deleteErr := fileSvc.DeleteFile(ctx, filePath); deleteErr != nil {
 			logger.Errorf(ctx, "Failed to delete saved file after knowledge creation failed, path: %s, error: %v", filePath, deleteErr)
@@ -201,6 +206,9 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 	if err := s.setAndAttachKnowledgeTags(ctx, tenantID, kbID, knowledge, tagIDs); err != nil {
 		logger.Errorf(ctx, "Failed to set knowledge tags, knowledge ID: %s, error: %v", knowledge.ID, err)
 		return nil, err
+	}
+	if interfaces.KnowledgeProcessingDeferred(ctx) {
+		return knowledge, nil
 	}
 
 	// Enqueue document processing task to Asynq
@@ -334,29 +342,27 @@ func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
 		return nil, ErrInvalidURL
 	}
 
-	// Check if URL already exists in the knowledge base
 	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
-	logger.Infof(ctx, "Checking if URL exists, tenant ID: %d", tenantID)
 	fileHash := calculateStr(url)
-	exists, existingKnowledge, err := s.repo.CheckKnowledgeExists(ctx, tenantID, kbID, &types.KnowledgeCheckParams{
-		Type:     "url",
-		URL:      url,
-		FileHash: fileHash,
-	})
-	if err != nil {
-		logger.Errorf(ctx, "Failed to check knowledge existence: %v", err)
-		return nil, err
-	}
-	if exists {
-		logger.Infof(ctx, "URL already exists: %s", url)
-		// Update creation time for existing knowledge
-		existingKnowledge.CreatedAt = time.Now()
-		existingKnowledge.UpdatedAt = time.Now()
-		if err := s.repo.UpdateKnowledge(ctx, existingKnowledge); err != nil {
-			logger.Errorf(ctx, "Failed to update existing knowledge: %v", err)
-			return nil, err
+	if interfaces.KnowledgeRecordPersisterFromContext(ctx) == nil {
+		logger.Infof(ctx, "Checking if URL exists, tenant ID: %d", tenantID)
+		exists, existingKnowledge, duplicateErr := s.repo.CheckKnowledgeExists(ctx, tenantID, kbID, &types.KnowledgeCheckParams{
+			Type: "url", URL: url, FileHash: fileHash,
+		})
+		if duplicateErr != nil {
+			logger.Errorf(ctx, "Failed to check knowledge existence: %v", duplicateErr)
+			return nil, duplicateErr
 		}
-		return existingKnowledge, types.NewDuplicateURLError(existingKnowledge)
+		if exists {
+			logger.Infof(ctx, "URL already exists: %s", url)
+			existingKnowledge.CreatedAt = time.Now()
+			existingKnowledge.UpdatedAt = time.Now()
+			if err := s.repo.UpdateKnowledge(ctx, existingKnowledge); err != nil {
+				logger.Errorf(ctx, "Failed to update existing knowledge: %v", err)
+				return nil, err
+			}
+			return existingKnowledge, types.NewDuplicateURLError(existingKnowledge)
+		}
 	}
 
 	// Check storage quota
@@ -392,7 +398,7 @@ func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
 		return nil, err
 	}
 
-	if err := s.repo.CreateKnowledge(ctx, knowledge); err != nil {
+	if err := s.persistNewKnowledge(ctx, knowledge); err != nil {
 		logger.Errorf(ctx, "Failed to create knowledge record: %v", err)
 		return nil, err
 	}
@@ -400,6 +406,9 @@ func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
 	if err := s.setAndAttachKnowledgeTags(ctx, tenantID, kbID, knowledge, tagIDs); err != nil {
 		logger.Errorf(ctx, "Failed to set knowledge tags, knowledge ID: %s, error: %v", knowledge.ID, err)
 		return nil, err
+	}
+	if interfaces.KnowledgeProcessingDeferred(ctx) {
+		return knowledge, nil
 	}
 
 	// Enqueue URL processing task to Asynq
@@ -572,27 +581,26 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 		displayName = fileURL
 	}
 
-	// Check for duplicate (by URL hash)
 	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
 	fileHash := calculateStr(fileURL)
-	exists, existingKnowledge, err := s.repo.CheckKnowledgeExists(ctx, tenantID, kbID, &types.KnowledgeCheckParams{
-		Type:     "file_url",
-		URL:      fileURL,
-		FileHash: fileHash,
-	})
-	if err != nil {
-		logger.Errorf(ctx, "Failed to check knowledge existence: %v", err)
-		return nil, err
-	}
-	if exists {
-		logger.Infof(ctx, "File URL already exists: %s", fileURL)
-		existingKnowledge.CreatedAt = time.Now()
-		existingKnowledge.UpdatedAt = time.Now()
-		if err := s.repo.UpdateKnowledge(ctx, existingKnowledge); err != nil {
-			logger.Errorf(ctx, "Failed to update existing knowledge: %v", err)
-			return nil, err
+	if interfaces.KnowledgeRecordPersisterFromContext(ctx) == nil {
+		exists, existingKnowledge, duplicateErr := s.repo.CheckKnowledgeExists(ctx, tenantID, kbID, &types.KnowledgeCheckParams{
+			Type: "file_url", URL: fileURL, FileHash: fileHash,
+		})
+		if duplicateErr != nil {
+			logger.Errorf(ctx, "Failed to check knowledge existence: %v", duplicateErr)
+			return nil, duplicateErr
 		}
-		return existingKnowledge, types.NewDuplicateURLError(existingKnowledge)
+		if exists {
+			logger.Infof(ctx, "File URL already exists: %s", fileURL)
+			existingKnowledge.CreatedAt = time.Now()
+			existingKnowledge.UpdatedAt = time.Now()
+			if err := s.repo.UpdateKnowledge(ctx, existingKnowledge); err != nil {
+				logger.Errorf(ctx, "Failed to update existing knowledge: %v", err)
+				return nil, err
+			}
+			return existingKnowledge, types.NewDuplicateURLError(existingKnowledge)
+		}
 	}
 
 	// Check storage quota
@@ -635,7 +643,7 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 		}
 	}
 
-	if err := s.repo.CreateKnowledge(ctx, knowledge); err != nil {
+	if err := s.persistNewKnowledge(ctx, knowledge); err != nil {
 		logger.Errorf(ctx, "Failed to create knowledge record: %v", err)
 		return nil, err
 	}
@@ -643,6 +651,9 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 	if err := s.setAndAttachKnowledgeTags(ctx, tenantID, kbID, knowledge, tagIDs); err != nil {
 		logger.Errorf(ctx, "Failed to set knowledge tags, knowledge ID: %s, error: %v", knowledge.ID, err)
 		return nil, err
+	}
+	if interfaces.KnowledgeProcessingDeferred(ctx) {
+		return knowledge, nil
 	}
 
 	// Build async task payload

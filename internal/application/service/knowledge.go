@@ -83,6 +83,13 @@ type knowledgeService struct {
 	audit       interfaces.AuditLogService
 }
 
+func (s *knowledgeService) persistNewKnowledge(ctx context.Context, knowledge *types.Knowledge) error {
+	if persister := interfaces.KnowledgeRecordPersisterFromContext(ctx); persister != nil {
+		return persister.CreateKnowledge(ctx, knowledge)
+	}
+	return s.repo.CreateKnowledge(ctx, knowledge)
+}
+
 const (
 	manualContentMaxLength = 200000
 	manualFileExtension    = ".md"

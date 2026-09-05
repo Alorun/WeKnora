@@ -314,6 +314,11 @@ type FetchedItem struct {
 	// Unique ID in the external system
 	ExternalID string `json:"external_id"`
 
+	// Revision is populated by external V1 plugins and identifies the immutable
+	// source version used by the Host revision ledger. Built-in connectors may
+	// leave it empty and retain their existing update semantics.
+	Revision string `json:"revision,omitempty"`
+
 	// Title of the content
 	Title string `json:"title"`
 

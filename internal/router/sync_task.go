@@ -17,13 +17,15 @@ import (
 // SyncTaskExecutor executes tasks synchronously (in a goroutine) without Redis.
 // Used in Lite mode as a drop-in replacement for *asynq.Client.
 type SyncTaskExecutor struct {
-	mu       sync.RWMutex
-	handlers map[string]func(context.Context, *asynq.Task) error
+	mu            sync.RWMutex
+	handlers      map[string]func(context.Context, *asynq.Task) error
+	activeTaskIDs map[string]struct{}
 }
 
 func NewSyncTaskExecutor() *SyncTaskExecutor {
 	return &SyncTaskExecutor{
-		handlers: make(map[string]func(context.Context, *asynq.Task) error),
+		handlers:      make(map[string]func(context.Context, *asynq.Task) error),
+		activeTaskIDs: make(map[string]struct{}),
 	}
 }
 
@@ -49,6 +51,8 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 	var delay time.Duration
 	maxRetry := 25 // asynq default
 	maxRetrySet := false
+	taskID := ""
+	queue := "sync"
 	for _, opt := range opts {
 		switch opt.Type() {
 		case asynq.ProcessInOpt:
@@ -60,6 +64,14 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 				maxRetry = n
 				maxRetrySet = true
 			}
+		case asynq.TaskIDOpt:
+			if id, ok := opt.Value().(string); ok {
+				taskID = id
+			}
+		case asynq.QueueOpt:
+			if name, ok := opt.Value().(string); ok {
+				queue = name
+			}
 		}
 	}
 	// Callers that explicitly pass MaxRetry(0) want no retries.
@@ -68,14 +80,29 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 		maxRetry = 0
 	}
 
-	taskID := uuid.New().String()
+	if taskID == "" {
+		taskID = uuid.New().String()
+	} else {
+		e.mu.Lock()
+		if _, exists := e.activeTaskIDs[taskID]; exists {
+			e.mu.Unlock()
+			return nil, asynq.ErrTaskIDConflict
+		}
+		e.activeTaskIDs[taskID] = struct{}{}
+		e.mu.Unlock()
+	}
 	info := &asynq.TaskInfo{
 		ID:    taskID,
-		Queue: "sync",
+		Queue: queue,
 		Type:  task.Type(),
 	}
 
 	go func() {
+		defer func() {
+			e.mu.Lock()
+			delete(e.activeTaskIDs, taskID)
+			e.mu.Unlock()
+		}()
 		if delay > 0 {
 			time.Sleep(delay)
 		}
@@ -154,6 +181,7 @@ func RegisterSyncHandlers(params SyncTaskParams) {
 	params.Executor.RegisterHandler(types.TypeKnowledgePostProcess, params.KnowledgePostProcess.Handle)
 	params.Executor.RegisterHandler(types.TypeKnowledgeAutoTag, params.KnowledgeAutoTag.Handle)
 	params.Executor.RegisterHandler(types.TypeDataSourceSync, params.DataSourceService.ProcessSync)
+	params.Executor.RegisterHandler(types.TypePluginDataSourceSync, params.DataSourceService.ProcessSync)
 	params.Executor.RegisterHandler(types.TypeWikiIngest, params.WikiIngest.Handle)
 	params.Executor.RegisterHandler(types.TypeWikiFinalize, params.WikiIngest.Handle)
 	params.Executor.RegisterHandler(types.TypeMemoryExtract, params.MemoryService.Handle)

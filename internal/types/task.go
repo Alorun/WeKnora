@@ -4,12 +4,13 @@ package types
 // backed by an independent asynq.Server, so concurrency is hard-isolated
 // between pools instead of being only a weighted dequeue preference.
 const (
-	WorkerPoolCore        = "core"
-	WorkerPoolPostProcess = "postprocess"
-	WorkerPoolEnrichment  = "enrichment"
-	WorkerPoolMaintenance = "maintenance"
-	WorkerPoolShared      = "shared"
-	WorkerPoolWiki        = "wiki"
+	WorkerPoolCore             = "core"
+	WorkerPoolPostProcess      = "postprocess"
+	WorkerPoolEnrichment       = "enrichment"
+	WorkerPoolMaintenance      = "maintenance"
+	WorkerPoolShared           = "shared"
+	WorkerPoolWiki             = "wiki"
+	WorkerPoolPluginController = "plugin_controller"
 
 	// Upstream defaults are explicit guarantees plus an elastic pool. The
 	// shared pool may consume core and enrichment queues, so idle capacity in
@@ -46,6 +47,9 @@ const (
 	// the enrichment pool because it is a background LLM call whose latency
 	// nobody is waiting on.
 	QueueMemory = "memory"
+	// QueuePlugin is consumed only by the one Plugin Controller worker. It is
+	// never included in the shared or maintenance pools.
+	QueuePlugin = "plugin"
 )
 
 // QueueDefinition is the single source of truth for queue topology. Worker
@@ -85,6 +89,7 @@ var queueDefinitions = []QueueDefinition{
 		TypeKnowledgeListDelete, TypeKnowledgeListReparse, TypeKnowledgeMove,
 	}},
 	{Name: QueueWiki, Pool: WorkerPoolWiki, Weight: 1, TaskTypes: []string{TypeWikiIngest, TypeWikiFinalize}},
+	{Name: QueuePlugin, Pool: WorkerPoolPluginController, Weight: 1, TaskTypes: []string{TypePluginDataSourceSync}},
 }
 
 // QueueDefinitions returns a copy so callers cannot mutate global topology.
@@ -249,6 +254,7 @@ const (
 	TypeKnowledgeAutoTag         = "knowledge:auto_tag"         // 文档自动关联知识库已有标签
 	TypeManualProcess            = "manual:process"             // 手工知识更新任务（cleanup + 重新索引）
 	TypeDataSourceSync           = "datasource:sync"            // 数据源同步任务
+	TypePluginDataSourceSync     = "plugin:datasource_sync"     // external datasource sync; controller only
 	TypeWikiIngest               = "wiki:ingest"                // Wiki 页面同步任务
 	TypeWikiFinalize             = "wiki:finalize"              // Wiki KB 级收尾任务（防抖：索引重建/死链清理/交叉链接）
 	TypeTemporaryDocumentProcess = "temporary_document:process" // 会话临时文档解析任务

@@ -9,6 +9,35 @@ import (
 	"github.com/hibiken/asynq"
 )
 
+// KnowledgeRecordPersister lets the external datasource revision path replace
+// the ordinary single-row insert with one transaction that writes both the
+// pending revision and its Knowledge row. It is request-scoped and is never
+// used by normal uploads or builtin connectors.
+type KnowledgeRecordPersister interface {
+	CreateKnowledge(context.Context, *types.Knowledge) error
+}
+
+type knowledgeRecordPersisterContextKey struct{}
+type deferKnowledgeProcessingContextKey struct{}
+
+func WithKnowledgeRecordPersister(ctx context.Context, persister KnowledgeRecordPersister) context.Context {
+	return context.WithValue(ctx, knowledgeRecordPersisterContextKey{}, persister)
+}
+
+func KnowledgeRecordPersisterFromContext(ctx context.Context) KnowledgeRecordPersister {
+	persister, _ := ctx.Value(knowledgeRecordPersisterContextKey{}).(KnowledgeRecordPersister)
+	return persister
+}
+
+func WithDeferredKnowledgeProcessing(ctx context.Context) context.Context {
+	return context.WithValue(ctx, deferKnowledgeProcessingContextKey{}, true)
+}
+
+func KnowledgeProcessingDeferred(ctx context.Context) bool {
+	deferred, _ := ctx.Value(deferKnowledgeProcessingContextKey{}).(bool)
+	return deferred
+}
+
 // KnowledgeService defines the interface for knowledge services.
 type KnowledgeService interface {
 	// CreateKnowledgeFromFile creates knowledge from a file.
@@ -193,6 +222,10 @@ type KnowledgeService interface {
 	ProcessManualUpdate(ctx context.Context, t *asynq.Task) error
 	// ProcessDocument handles Asynq document processing tasks
 	ProcessDocument(ctx context.Context, t *asynq.Task) error
+	// BuildDocumentProcessTask reconstructs the canonical parse task for an
+	// already-persisted Knowledge row. External revision recovery uses it so a
+	// lost enqueue retains the same KB-derived processing options as creation.
+	BuildDocumentProcessTask(ctx context.Context, knowledgeID string) (*asynq.Task, []asynq.Option, error)
 	// ProcessFAQImport handles Asynq FAQ import tasks
 	ProcessFAQImport(ctx context.Context, t *asynq.Task) error
 	// ProcessQuestionGeneration handles Asynq question generation tasks

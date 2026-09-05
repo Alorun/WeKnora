@@ -34,6 +34,13 @@ type DataSourceService struct {
 	tenantRepo        interfaces.TenantRepository
 	tagService        interfaces.KnowledgeTagService
 	audit             interfaces.AuditLogService
+	externalIngestor  datasource.ExternalRevisionIngestor
+}
+
+// SetExternalRevisionIngestor installs the Phase-B-only durable ingestion
+// path without changing the constructor used by existing tests and builtins.
+func (s *DataSourceService) SetExternalRevisionIngestor(ingestor datasource.ExternalRevisionIngestor) {
+	s.externalIngestor = ingestor
 }
 
 // NewDataSourceService creates a new data source service
@@ -79,7 +86,7 @@ func (s *DataSourceService) CreateDataSource(ctx context.Context, ds *types.Data
 	}
 
 	// Validate connector type
-	_, err = s.connectorRegistry.Get(ds.Type)
+	_, err = s.connectorRegistry.ResolveConnector(ctx, ds)
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +362,7 @@ func (s *DataSourceService) ValidateConnection(ctx context.Context, dsID string)
 	}
 
 	// Get connector
-	connector, err := s.connectorRegistry.Get(ds.Type)
+	connector, err := s.connectorRegistry.ResolveConnector(ctx, ds)
 	if err != nil {
 		return err
 	}
@@ -397,7 +404,7 @@ func (s *DataSourceService) ListAvailableResources(
 	}
 
 	// Get connector
-	connector, err := s.connectorRegistry.Get(ds.Type)
+	connector, err := s.connectorRegistry.ResolveConnector(ctx, ds)
 	if err != nil {
 		return nil, err
 	}
@@ -432,7 +439,7 @@ func (s *DataSourceService) ResolveResourceAncestors(
 		return nil, err
 	}
 
-	connector, err := s.connectorRegistry.Get(ds.Type)
+	connector, err := s.connectorRegistry.ResolveConnector(ctx, ds)
 	if err != nil {
 		return nil, err
 	}
@@ -463,6 +470,10 @@ func (s *DataSourceService) ManualSync(ctx context.Context, dsID string) (*types
 		ds.Status != types.DataSourceStatusPaused {
 		return nil, datasource.ErrDataSourceNotActive
 	}
+	isExternal, err := s.connectorRegistry.HasExternalBinding(ctx, ds.ID)
+	if err != nil {
+		return nil, err
+	}
 
 	// Create sync log
 	syncLog := &types.SyncLog{
@@ -489,8 +500,14 @@ func (s *DataSourceService) ManualSync(ctx context.Context, dsID string) (*types
 	langfuse.InjectTracing(ctx, payload)
 
 	payloadJSON, _ := json.Marshal(payload)
-	task := asynq.NewTask(types.TypeDataSourceSync, payloadJSON,
-		asynq.Queue(types.QueueSync), asynq.MaxRetry(5), asynq.Timeout(2*time.Hour))
+	taskType := types.TypeDataSourceSync
+	queue := types.QueueSync
+	if isExternal {
+		taskType = types.TypePluginDataSourceSync
+		queue = types.QueuePlugin
+	}
+	task := asynq.NewTask(taskType, payloadJSON,
+		asynq.Queue(queue), asynq.MaxRetry(5), asynq.Timeout(2*time.Hour))
 
 	info, err := s.taskEnqueuer.Enqueue(task)
 	if err != nil {
@@ -630,7 +647,7 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 	wasPaused := ds.Status == types.DataSourceStatusPaused
 
 	// Get connector
-	connector, err := s.connectorRegistry.Get(ds.Type)
+	connector, err := s.connectorRegistry.ResolveConnector(ctx, ds)
 	if err != nil {
 		logger.Errorf(ctx, "connector not found: type=%s", ds.Type)
 		syncLog.Status = types.SyncLogStatusFailed
@@ -982,11 +999,12 @@ func streamStartCursor(ds *types.DataSource, forceFull bool, attempt int) (*type
 // Emit ingests each item as it arrives (bounding memory) and Checkpoint persists
 // the connector cursor plus live progress counts at page boundaries.
 type streamSyncHandler struct {
-	svc     *DataSourceService
-	ds      *types.DataSource
-	tagIDs  []string
-	result  *types.SyncResult
-	syncLog *types.SyncLog
+	svc      *DataSourceService
+	ds       *types.DataSource
+	tagIDs   []string
+	result   *types.SyncResult
+	syncLog  *types.SyncLog
+	external bool
 }
 
 // Emit ingests one streamed item. A canceled context aborts the stream so the
@@ -998,6 +1016,28 @@ func (h *streamSyncHandler) Emit(ctx context.Context, item types.FetchedItem) er
 		return err
 	}
 	h.result.Total++
+	if h.external {
+		if h.svc.externalIngestor == nil {
+			return fmt.Errorf("external revision ingestor is not configured")
+		}
+		outcome, err := h.svc.externalIngestor.AcceptExternalItem(
+			withKBActivitySuppressed(ctx), h.ds, item, h.tagIDs,
+		)
+		if err != nil {
+			return err
+		}
+		switch {
+		case outcome.Deleted:
+			h.result.Deleted++
+		case outcome.Updated:
+			h.result.Updated++
+		case outcome.Created:
+			h.result.Created++
+		default:
+			h.result.Skipped++
+		}
+		return nil
+	}
 	h.svc.applyFetchedItem(withKBActivitySuppressed(ctx), h.ds, &item, h.tagIDs, h.result)
 	return nil
 }
@@ -1064,7 +1104,16 @@ func (s *DataSourceService) processSyncStreaming(
 	}
 
 	result := &types.SyncResult{}
-	handler := &streamSyncHandler{svc: s, ds: ds, tagIDs: autoTagIDs, result: result, syncLog: syncLog}
+	external := false
+	if marker, ok := sc.(datasource.ExternalConnector); ok {
+		external = marker.IsExternal()
+	}
+	if external && s.externalIngestor == nil {
+		err := fmt.Errorf("external revision ingestor is not configured")
+		s.updateSyncRunResult(ctx, ds, syncLog, result, nil, types.SyncLogStatusFailed, err.Error(), wasPaused)
+		return err
+	}
+	handler := &streamSyncHandler{svc: s, ds: ds, tagIDs: autoTagIDs, result: result, syncLog: syncLog, external: external}
 
 	nextCursor, fetchErr := sc.FetchStream(ctx, config, startCursor, handler)
 	if fetchErr != nil {
@@ -1212,7 +1261,7 @@ func (s *DataSourceService) ValidateCredentials(ctx context.Context, connectorTy
 // Helper functions
 
 func (s *DataSourceService) validateDataSourceConfig(ctx context.Context, ds *types.DataSource) error {
-	connector, err := s.connectorRegistry.Get(ds.Type)
+	connector, err := s.connectorRegistry.ResolveConnector(ctx, ds)
 	if err != nil {
 		return err
 	}
