@@ -77,6 +77,13 @@ func BuiltinEngineRegistrations() []EngineRegistration {
 	return result
 }
 
+func IsEngineDeclared(name string) bool {
+	localEnginesMu.RLock()
+	defer localEnginesMu.RUnlock()
+	_, exists := declaredEngines[name]
+	return exists
+}
+
 // PublishEngine makes a declared engine available to new parser requests.
 func PublishEngine(e EngineRegistration) error {
 	if e == nil || e.Name() == "" {
@@ -134,10 +141,17 @@ func NewReader(
 	ctx context.Context, engine, fileType string, isURL bool, deps ReaderDeps,
 ) (interfaces.DocReader, error) {
 	if registration, ok := lookupEngine(engine); ok {
-		return registration.NewReader(ctx, deps)
+		reader, err := registration.NewReader(ctx, deps)
+		return managedFallbackReader(engine, reader), err
+	}
+	if engine != "" && IsEngineDeclared(engine) {
+		return nil, errEngineUnavailable(engine, "stopped")
 	}
 	if engine == "" && !isURL && IsSimpleFormat(fileType) {
-		return &SimpleFormatReader{}, nil
+		if registration, ok := lookupEngine(SimpleEngineName); ok {
+			reader, err := registration.NewReader(ctx, deps)
+			return managedFallbackReader(SimpleEngineName, reader), err
+		}
 	}
 	return remoteReader(deps)
 }
@@ -145,10 +159,45 @@ func NewReader(
 // remoteReader returns the docreader client, or an error when the service is
 // not connected — a nil interface value here would panic at the call site.
 func remoteReader(deps ReaderDeps) (interfaces.DocReader, error) {
+	if !HasEngine(BuiltinEngineName) {
+		return nil, errEngineUnavailable(BuiltinEngineName, "stopped")
+	}
 	if deps.Remote == nil {
 		return nil, errNotConnected
 	}
-	return deps.Remote, nil
+	return managedFallbackReader(BuiltinEngineName, deps.Remote), nil
+}
+
+// managedFallbackReader keeps an internal parser fallback on the same
+// lifecycle gate as direct routing. It prevents a reader created just before
+// the DocReader bridge stops from invoking that stopped bridge later.
+func managedFallbackReader(engine string, reader interfaces.DocReader) interfaces.DocReader {
+	if reader == nil {
+		return nil
+	}
+	return &activeEngineReader{engine: engine, inner: reader}
+}
+
+type activeEngineReader struct {
+	engine string
+	inner  interfaces.DocReader
+}
+
+func (r *activeEngineReader) Read(ctx context.Context, req *types.ReadRequest) (*types.ReadResult, error) {
+	if !HasEngine(r.engine) {
+		return nil, errEngineUnavailable(r.engine, "stopped")
+	}
+	return r.inner.Read(ctx, req)
+}
+
+func (r *activeEngineReader) IsConnected() bool {
+	if !HasEngine(r.engine) {
+		return false
+	}
+	if connected, ok := r.inner.(interface{ IsConnected() bool }); ok {
+		return connected.IsConnected()
+	}
+	return true
 }
 
 // ListAllEngines returns the merged engine list: locally registered engines
@@ -171,9 +220,12 @@ func ListAllEngines(
 	}
 	localEnginesMu.RUnlock()
 
+	bridgeReady := HasEngine(BuiltinEngineName)
 	remoteMap := make(map[string]types.ParserEngineInfo, len(remoteEngines))
-	for _, re := range remoteEngines {
-		remoteMap[re.Name] = re
+	if bridgeReady {
+		for _, re := range remoteEngines {
+			remoteMap[re.Name] = re
+		}
 	}
 
 	seen := make(map[string]bool, len(engines))
@@ -205,11 +257,13 @@ func ListAllEngines(
 		})
 	}
 
-	for _, re := range remoteEngines {
-		if seen[re.Name] {
-			continue
+	if bridgeReady {
+		for _, re := range remoteEngines {
+			if seen[re.Name] || IsEngineDeclared(re.Name) {
+				continue
+			}
+			result = append(result, re)
 		}
-		result = append(result, re)
 	}
 
 	return result

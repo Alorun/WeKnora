@@ -16,10 +16,11 @@ type ExtensionID string
 type ExtensionType string
 
 const (
-	ExtensionDataSource     ExtensionType = "datasource"
-	ExtensionDocumentParser ExtensionType = "document_parser"
-	ExtensionWebSearch      ExtensionType = "web_search"
-	ExtensionModelProvider  ExtensionType = "model_provider"
+	ExtensionDataSource      ExtensionType = "datasource"
+	ExtensionDocumentParser  ExtensionType = "document_parser"
+	ExtensionWebSearch       ExtensionType = "web_search"
+	ExtensionModelProvider   ExtensionType = "model_provider"
+	ExtensionRetrievalEngine ExtensionType = "retrieval_engine"
 )
 
 type SourceType string
@@ -94,7 +95,7 @@ func (d PluginDefinition) Validate() error {
 
 func (t ExtensionType) Valid() bool {
 	switch t {
-	case ExtensionDataSource, ExtensionDocumentParser, ExtensionWebSearch, ExtensionModelProvider:
+	case ExtensionDataSource, ExtensionDocumentParser, ExtensionWebSearch, ExtensionModelProvider, ExtensionRetrievalEngine:
 		return true
 	default:
 		return false

@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"testing"
 
 	"go.uber.org/dig"
@@ -10,7 +11,9 @@ import (
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/config"
+	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/stretchr/testify/require"
 )
 
 // TestRetrieveEngineRegistryWiring checks that the container can still build
@@ -40,6 +43,7 @@ func TestRetrieveEngineRegistryWiring(t *testing.T) {
 	provide(func() *gorm.DB { return db })
 	provide(func() *config.Config { return &config.Config{} })
 	provide(func() interfaces.AuditLogService { return &fakeAuditSvc{} })
+	provide(retriever.NewDriverGate)
 	provide(repository.NewVectorStoreRepository)
 	provide(NewEngineFactory)
 	provide(initRetrieveEngineRegistry)
@@ -56,4 +60,25 @@ func TestRetrieveEngineRegistryWiring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("container could not build the registry: %v", err)
 	}
+}
+
+func TestEngineFactoryRequiresManagedRetrievalDriver(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	drivers := retriever.NewDriverGate()
+	registry := retriever.NewRetrieveEngineRegistryWithGate(nil, nil, drivers)
+	factory := NewEngineFactory(db, &config.Config{}, &fakeAuditSvc{}, drivers)
+	store := types.VectorStore{EngineType: types.SQLiteRetrieverEngineType}
+
+	_, err = factory(context.Background(), store)
+	require.ErrorIs(t, err, retriever.ErrDriverNotActive)
+	require.NoError(t, registry.PublishDriver(types.SQLiteRetrieverEngineType))
+	engine, err := factory(context.Background(), store)
+	require.NoError(t, err)
+	require.NotEmpty(t, engine.Support(), "the real SQLite driver is callable after publication")
+	require.NoError(t, registry.UnpublishDriver(types.SQLiteRetrieverEngineType))
+	_, err = engine.Retrieve(context.Background(), types.RetrieveParams{})
+	require.ErrorIs(t, err, retriever.ErrDriverNotActive, "a retained real backend must be stopped too")
+	_, err = factory(context.Background(), store)
+	require.ErrorIs(t, err, retriever.ErrDriverNotActive)
 }

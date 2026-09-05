@@ -48,7 +48,7 @@ func preferAnydocWhenAvailable(fileType string) string {
 	if IsSimpleFormat(fileType) {
 		return ""
 	}
-	if anydoc.Available() && anydoc.Supports(fileType, "") {
+	if HasEngine(AnydocEngineName) && anydoc.Available() && anydoc.Supports(fileType, "") {
 		return AnydocEngineName
 	}
 	return ""
@@ -143,7 +143,7 @@ func (e *anydocEngine) NewReader(_ context.Context, deps ReaderDeps) (interfaces
 	if !anydoc.Available() {
 		return nil, errEngineUnavailable(AnydocEngineName, anydoc.UnavailableReason())
 	}
-	return NewAnydocReader(deps.Overrides, deps.Remote), nil
+	return NewAnydocReader(deps.Overrides, managedFallbackReader(BuiltinEngineName, deps.Remote)), nil
 }
 
 // ---------------------------------------------------------------------------

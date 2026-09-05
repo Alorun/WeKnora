@@ -43,10 +43,16 @@ import (
 // injected into VectorStoreService for dynamic registry updates. The
 // EngineFactory type itself is unchanged — the audit sink is captured in the
 // closure rather than added to the signature.
-func NewEngineFactory(db *gorm.DB, cfg *config.Config, auditSvc interfaces.AuditLogService) interfaces.EngineFactory {
+func NewEngineFactory(
+	db *gorm.DB, cfg *config.Config, auditSvc interfaces.AuditLogService, drivers *retriever.DriverGate,
+) interfaces.EngineFactory {
 	sink := newAuditSinkAdapter(auditSvc)
 	return func(ctx context.Context, store types.VectorStore) (interfaces.RetrieveEngineService, error) {
-		return createEngineServiceFromStore(ctx, store, db, cfg, sink)
+		if err := drivers.RequireActive(store.EngineType); err != nil {
+			return nil, err
+		}
+		service, err := createEngineServiceFromStore(ctx, store, db, cfg, sink)
+		return drivers.Guard(service), err
 	}
 }
 

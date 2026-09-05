@@ -9,7 +9,6 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/models/embedding"
 	"github.com/Tencent/WeKnora/internal/types"
-	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -115,15 +114,22 @@ func (f *fakeEngine) BatchUpdateChunkTagID(ctx context.Context, _ map[string]str
 // tenant's effective engines.
 func registryWithStores(t *testing.T, stores map[string]*fakeEngine, engineTypes map[types.RetrieverEngineType]*fakeEngine) *RetrieveEngineRegistry {
 	t.Helper()
-	r := &RetrieveEngineRegistry{
-		byEngineType: map[types.RetrieverEngineType]interfaces.RetrieveEngineService{},
-		byStoreID:    map[string]interfaces.RetrieveEngineService{},
+	r := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	active := make(map[types.RetrieverEngineType]struct{})
+	for _, svc := range stores {
+		active[svc.EngineType()] = struct{}{}
+	}
+	for engineType := range engineTypes {
+		active[engineType] = struct{}{}
+	}
+	for engineType := range active {
+		require.NoError(t, r.PublishDriver(engineType))
 	}
 	for id, svc := range stores {
-		r.byStoreID[id] = svc
+		r.RegisterWithStoreID(id, svc)
 	}
-	for et, svc := range engineTypes {
-		r.byEngineType[et] = svc
+	for _, svc := range engineTypes {
+		require.NoError(t, r.Register(svc))
 	}
 	return r
 }
@@ -167,7 +173,7 @@ func TestCreateRetrieveEngineForKB_Unbound(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, engine)
 			assert.Len(t, engine.engineInfos, 1, "unbound path uses tenant effective engines")
-			assert.Same(t, postgresEngine, engine.engineInfos[0].retrieveEngine)
+			assert.Same(t, postgresEngine, engine.engineInfos[0].retrieveEngine.(*managedEngine).RetrieveEngineService)
 			assert.Zero(t, ownership.callCount(),
 				"ownership must not be called on the unbound path")
 		})
@@ -201,7 +207,7 @@ func TestCreateRetrieveEngineForKB_StoreBound(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, engine)
 	require.Len(t, engine.engineInfos, 1)
-	assert.Same(t, esEngine, engine.engineInfos[0].retrieveEngine)
+	assert.Same(t, esEngine, engine.engineInfos[0].retrieveEngine.(*managedEngine).RetrieveEngineService)
 	assert.Equal(t,
 		[]types.RetrieverType{types.KeywordsRetrieverType, types.VectorRetrieverType},
 		engine.engineInfos[0].retrieverType,
@@ -309,7 +315,7 @@ func TestCreateRetrieveEngineFromPayload_LegacyUnbound(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, engine)
 			require.Len(t, engine.engineInfos, 1)
-			assert.Same(t, postgresEngine, engine.engineInfos[0].retrieveEngine)
+			assert.Same(t, postgresEngine, engine.engineInfos[0].retrieveEngine.(*managedEngine).RetrieveEngineService)
 			assert.Zero(t, ownership.callCount(),
 				"unbound payload must not trigger ownership lookup")
 		})
@@ -334,7 +340,7 @@ func TestCreateRetrieveEngineFromPayload_Bound(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, engine)
 	require.Len(t, engine.engineInfos, 1)
-	assert.Same(t, qdrantEngine, engine.engineInfos[0].retrieveEngine)
+	assert.Same(t, qdrantEngine, engine.engineInfos[0].retrieveEngine.(*managedEngine).RetrieveEngineService)
 }
 
 func TestCreateRetrieveEngineFromPayload_TamperedCrossTenant(t *testing.T) {

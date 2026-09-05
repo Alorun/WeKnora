@@ -2,6 +2,7 @@
 package provider
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -155,11 +156,25 @@ type Provider interface {
 	ValidateConfig(config *Config) error
 }
 
+type Capability string
+
+const (
+	CapabilityChat      Capability = "chat"
+	CapabilityEmbedding Capability = "embedding"
+	CapabilityRerank    Capability = "rerank"
+)
+
+var (
+	ErrProviderNotActive   = errors.New("model provider is not active")
+	ErrCapabilityNotActive = errors.New("model provider capability is not active")
+)
+
 // registry 存储所有注册的提供者
 var (
 	registryMu   sync.RWMutex
 	registry     = make(map[ProviderName]Provider)
 	declarations = make(map[ProviderName]Provider)
+	capabilities = make(map[ProviderName]map[Capability]struct{})
 )
 
 // Register retains the legacy declaration entry point without publishing the
@@ -198,6 +213,36 @@ func BuiltinProviders() []Provider {
 	return result
 }
 
+func IsDeclared(name ProviderName) bool {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	_, exists := declarations[name]
+	return exists
+}
+
+// CapabilitiesFor derives the managed factory capabilities from metadata.
+// VLLM uses the chat adapter family and is therefore a chat capability.
+func CapabilitiesFor(info ProviderInfo) []Capability {
+	seen := make(map[Capability]struct{}, 3)
+	for _, modelType := range info.ModelTypes {
+		switch modelType {
+		case types.ModelTypeKnowledgeQA, types.ModelTypeVLLM:
+			seen[CapabilityChat] = struct{}{}
+		case types.ModelTypeEmbedding:
+			seen[CapabilityEmbedding] = struct{}{}
+		case types.ModelTypeRerank:
+			seen[CapabilityRerank] = struct{}{}
+		}
+	}
+	result := make([]Capability, 0, len(seen))
+	for _, capability := range []Capability{CapabilityChat, CapabilityEmbedding, CapabilityRerank} {
+		if _, exists := seen[capability]; exists {
+			result = append(result, capability)
+		}
+	}
+	return result
+}
+
 // Publish publishes a declared provider to the business registry.
 func Publish(p Provider) error {
 	if p == nil || p.Info().Name == "" {
@@ -209,6 +254,11 @@ func Publish(p Provider) error {
 		return fmt.Errorf("model provider %q already registered", p.Info().Name)
 	}
 	registry[p.Info().Name] = p
+	active := make(map[Capability]struct{})
+	for _, capability := range CapabilitiesFor(p.Info()) {
+		active[capability] = struct{}{}
+	}
+	capabilities[p.Info().Name] = active
 	return nil
 }
 
@@ -219,6 +269,7 @@ func Unregister(name ProviderName) error {
 		return fmt.Errorf("model provider %q not registered", name)
 	}
 	delete(registry, name)
+	delete(capabilities, name)
 	return nil
 }
 
@@ -230,15 +281,52 @@ func Get(name ProviderName) (Provider, bool) {
 	return p, ok
 }
 
+func HasCapability(name ProviderName, capability Capability) bool {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	_, providerActive := registry[name]
+	_, capabilityActive := capabilities[name][capability]
+	return providerActive && capabilityActive
+}
+
+// RequireCapability gates the existing factory switches without replacing
+// their provider implementations.
+func RequireCapability(name ProviderName, capability Capability) error {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	target := name
+	if _, active := registry[target]; !active {
+		// Preserve the established custom-provider behavior: an unknown name
+		// uses the generic OpenAI-compatible adapter. A declared provider is
+		// different—if it is absent from registry it was stopped and must not
+		// escape through that fallback.
+		if _, declared := declarations[name]; declared {
+			return fmt.Errorf("%s: %w", name, ErrProviderNotActive)
+		}
+		target = ProviderGeneric
+		if _, active := registry[target]; !active {
+			return fmt.Errorf("%s: %w", name, ErrProviderNotActive)
+		}
+	}
+	if _, active := capabilities[target][capability]; !active {
+		return fmt.Errorf("%s/%s: %w", target, capability, ErrCapabilityNotActive)
+	}
+	return nil
+}
+
 // GetOrDefault 通过名称从注册表中获取提供者，如果未找到则返回默认提供者
 func GetOrDefault(name ProviderName) Provider {
-	p, ok := Get(name)
-	if ok {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	if p, ok := registry[name]; ok {
 		return p
 	}
-	// 如果未找到则返回默认提供者
-	p, _ = Get(ProviderGeneric)
-	return p
+	// A known built-in that has been stopped must not silently turn into the
+	// generic provider. Preserve the legacy fallback only for unknown names.
+	if _, declared := declarations[name]; declared {
+		return nil
+	}
+	return registry[ProviderGeneric]
 }
 
 // List 返回所有注册的提供者（按 AllProviders 定义的顺序）

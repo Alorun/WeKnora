@@ -121,6 +121,9 @@ func newEmbedder(config Config, pooler EmbedderPooler, ollamaService *ollama.Oll
 		if providerName == "" {
 			providerName = provider.DetectProvider(config.BaseURL)
 		}
+		if err := provider.RequireCapability(providerName, provider.CapabilityEmbedding); err != nil {
+			return nil, err
+		}
 
 		// Route to provider-specific embedders
 		switch providerName {

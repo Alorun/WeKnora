@@ -124,6 +124,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 
 	// Initialize retrieval engine registry for search capabilities
 	logger.Debugf(ctx, "[Container] Registering retrieval engine registry...")
+	must(container.Provide(retriever.NewDriverGate))
 	must(container.Provide(initRetrieveEngineRegistry))
 
 	// External service clients
@@ -257,10 +258,11 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(plugindatasource.NewResolver))
 	must(container.Provide(plugindatasource.NewConnectorRouter))
 	must(container.Provide(plugindatasource.NewRevisionProcessor))
+	must(container.Provide(repository.NewVectorStoreRepository))
+	must(container.Provide(NewEngineFactory))
 	must(container.Provide(newPluginManager))
 	must(container.Invoke(startBuiltinPluginControlPlane))
 	must(container.Provide(repository.NewWebSearchProviderRepository))
-	must(container.Provide(repository.NewVectorStoreRepository))
 	must(container.Provide(repository.NewStorageBackendRepository))
 	must(container.Provide(repository.NewResourceRepository))
 	must(container.Provide(repository.NewTemporaryDocumentRepository))
@@ -270,7 +272,6 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(retriever.NewVectorStoreRepoOwnership))
 	must(container.Provide(service.NewWebSearchService))
 	must(container.Provide(service.NewWebSearchProviderService))
-	must(container.Provide(NewEngineFactory))
 	// StoreRegistry: same instance as RetrieveEngineRegistry, exposed as StoreRegistry interface.
 	// NewRetrieveEngineRegistry always returns *retriever.RetrieveEngineRegistry which implements both.
 	must(container.Provide(func(r interfaces.RetrieveEngineRegistry) (interfaces.StoreRegistry, error) {
@@ -1119,12 +1120,12 @@ func initRawFileService(_ *config.Config) (interfaces.FileService, error) {
 //   - Error if initialization fails
 func initRetrieveEngineRegistry(
 	db *gorm.DB, cfg *config.Config, auditSvc interfaces.AuditLogService,
-	storeRepo interfaces.VectorStoreRepository, engineFactory interfaces.EngineFactory,
+	storeRepo interfaces.VectorStoreRepository, engineFactory interfaces.EngineFactory, drivers *retriever.DriverGate,
 ) (interfaces.RetrieveEngineRegistry, error) {
 	// storeRepo and engineFactory let the registry rebuild a store engine that
 	// is absent from this process, which happens when startup skipped it after
 	// a construction failure or when another instance registered it.
-	registry := retriever.NewRetrieveEngineRegistry(storeRepo, engineFactory)
+	registry := retriever.NewRetrieveEngineRegistryWithGate(storeRepo, engineFactory, drivers)
 	retrieveDriver := strings.Split(os.Getenv("RETRIEVE_DRIVER"), ",")
 	log := logger.GetLogger(context.Background())
 	// Audit sink for OpenSearch driver events (index created / reindex). Driver
@@ -1134,7 +1135,7 @@ func initRetrieveEngineRegistry(
 
 	if slices.Contains(retrieveDriver, "postgres") {
 		postgresRepo := postgresRepo.NewPostgresRetrieveEngineRepository(db)
-		if err := registry.Register(
+		if err := registry.Declare(
 			retriever.NewKVHybridRetrieveEngine(postgresRepo, types.PostgresRetrieverEngineType),
 		); err != nil {
 			log.Errorf("Register postgres retrieve engine failed: %v", err)
@@ -1144,7 +1145,7 @@ func initRetrieveEngineRegistry(
 	}
 	if slices.Contains(retrieveDriver, "sqlite") {
 		sqliteRepo := sqliteRetrieverRepo.NewSQLiteRetrieveEngineRepository(db)
-		if err := registry.Register(
+		if err := registry.Declare(
 			retriever.NewKVHybridRetrieveEngine(sqliteRepo, types.SQLiteRetrieverEngineType),
 		); err != nil {
 			log.Errorf("Register sqlite retrieve engine failed: %v", err)
@@ -1162,7 +1163,7 @@ func initRetrieveEngineRegistry(
 			log.Errorf("Create elasticsearch_v8 client failed: %v", err)
 		} else {
 			elasticsearchRepo := elasticsearchRepoV8.NewElasticsearchEngineRepository(client, cfg, nil)
-			if err := registry.Register(
+			if err := registry.Declare(
 				retriever.NewKVHybridRetrieveEngine(
 					elasticsearchRepo, types.ElasticsearchRetrieverEngineType,
 				),
@@ -1184,7 +1185,7 @@ func initRetrieveEngineRegistry(
 			log.Errorf("Create elasticsearch_v7 client failed: %v", err)
 		} else {
 			elasticsearchRepo := elasticsearchRepoV7.NewElasticsearchEngineRepository(client, cfg, nil)
-			if err := registry.Register(
+			if err := registry.Declare(
 				retriever.NewKVHybridRetrieveEngine(
 					elasticsearchRepo, types.ElasticsearchRetrieverEngineType,
 				),
@@ -1210,7 +1211,7 @@ func initRetrieveEngineRegistry(
 			context.Background(), client, "", nil, openSearchRepo.WithAuditSink(auditSink),
 		); err != nil {
 			log.Errorf("Create opensearch repository failed: %v", err)
-		} else if err := registry.Register(
+		} else if err := registry.Declare(
 			retriever.NewKVHybridRetrieveEngine(repo, types.OpenSearchRetrieverEngineType),
 		); err != nil {
 			log.Errorf("Register opensearch retrieve engine failed: %v", err)
@@ -1255,7 +1256,7 @@ func initRetrieveEngineRegistry(
 			log.Errorf("Create qdrant client failed: %v", err)
 		} else {
 			qdrantRepository := qdrantRepo.NewQdrantRetrieveEngineRepository(client, nil)
-			if err := registry.Register(
+			if err := registry.Declare(
 				retriever.NewKVHybridRetrieveEngine(
 					qdrantRepository, types.QdrantRetrieverEngineType,
 				),
@@ -1298,7 +1299,7 @@ func initRetrieveEngineRegistry(
 			log.Errorf("Create weaviate client failed: %v", err)
 		} else {
 			weaviateRepository := weaviateRepo.NewWeaviateRetrieveEngineRepository(weaviateClient, nil)
-			if err := registry.Register(
+			if err := registry.Declare(
 				retriever.NewKVHybridRetrieveEngine(
 					weaviateRepository, types.WeaviateRetrieverEngineType,
 				),
@@ -1335,7 +1336,7 @@ func initRetrieveEngineRegistry(
 			log.Errorf("Create milvus client failed: %v", err)
 		} else {
 			milvusRepository := milvusRepo.NewMilvusRetrieveEngineRepository(milvusCli, nil)
-			if err := registry.Register(
+			if err := registry.Declare(
 				retriever.NewKVHybridRetrieveEngine(
 					milvusRepository, types.MilvusRetrieverEngineType,
 				),
@@ -1382,7 +1383,7 @@ func initRetrieveEngineRegistry(
 			dorisRepository := dorisRepo.NewDorisRetrieveEngineRepository(
 				dorisDB, httpBase, dorisUsername, dorisPassword, dorisDatabase, nil,
 			)
-			if err := registry.Register(
+			if err := registry.Declare(
 				retriever.NewKVHybridRetrieveEngine(
 					dorisRepository, types.DorisRetrieverEngineType,
 				),
@@ -1412,7 +1413,7 @@ func initRetrieveEngineRegistry(
 					os.Getenv("TENCENT_VECTORDB_DATABASE"),
 					nil,
 				)
-				if err := registry.Register(
+				if err := registry.Declare(
 					retriever.NewKVHybridRetrieveEngine(
 						tencentRepository, types.TencentVectorDBRetrieverEngineType,
 					),
@@ -1425,17 +1426,16 @@ func initRetrieveEngineRegistry(
 		}
 	}
 	// ─── DB store registration (byStoreID) ───
-	if storeReg, ok := registry.(*retriever.RetrieveEngineRegistry); ok {
-		loadDBStoresIntoRegistry(storeReg, db, cfg, auditSink)
-	}
+	loadDBStoresIntoRegistry(registry, db, cfg, auditSink)
 
 	return registry, nil
 }
 
-// loadDBStoresIntoRegistry loads VectorStore records from DB and registers them
-// in the registry's byStoreID map. Failures are logged and skipped (non-fatal).
+// loadDBStoresIntoRegistry loads VectorStore records from DB and stages them
+// for publication by the matching RetrievalRegistrar. Failures are logged and
+// skipped (non-fatal).
 func loadDBStoresIntoRegistry(
-	storeRegistry interfaces.StoreRegistry, db *gorm.DB, cfg *config.Config, auditSink openSearchRepo.AuditSink,
+	storeRegistry *retriever.RetrieveEngineRegistry, db *gorm.DB, cfg *config.Config, auditSink openSearchRepo.AuditSink,
 ) {
 	ctx := context.Background()
 	log := logger.GetLogger(ctx)
@@ -1458,8 +1458,8 @@ func loadDBStoresIntoRegistry(
 			log.Errorf("Failed to create engine for store %s (%s): %v", store.ID, store.Name, err)
 			continue
 		}
-		storeRegistry.RegisterWithStoreID(store.ID, svc)
-		log.Infof("Registered DB vector store: id=%s, name=%s, engine=%s", store.ID, store.Name, store.EngineType)
+		storeRegistry.DeclareWithStoreID(store.ID, svc)
+		log.Infof("Declared DB vector store: id=%s, name=%s, engine=%s", store.ID, store.Name, store.EngineType)
 	}
 }
 
@@ -1624,13 +1624,22 @@ func startBuiltinPluginControlPlane(
 	manager *pluginmanager.PluginManager,
 	connectors *datasource.ConnectorRegistry,
 	web *infra_web_search.Registry,
+	retrieval interfaces.RetrieveEngineRegistry,
+	cleaner interfaces.ResourceCleaner,
 ) error {
-	if err := manager.LoadBuiltins(pluginbuiltin.Descriptors(connectors, web)); err != nil {
+	retrievalRegistry, ok := retrieval.(*retriever.RetrieveEngineRegistry)
+	if !ok {
+		return fmt.Errorf("retrieval registry does not support managed driver lifecycle")
+	}
+	if err := manager.LoadBuiltins(pluginbuiltin.Descriptors(connectors, web, retrievalRegistry)); err != nil {
 		return fmt.Errorf("load builtin plugin descriptors: %w", err)
 	}
 	if err := manager.StartAll(context.Background()); err != nil {
 		return fmt.Errorf("start builtin plugin control plane: %w", err)
 	}
+	cleaner.RegisterWithName("BuiltinPluginControlPlane", func() error {
+		return manager.StopAll(context.Background())
+	})
 	return nil
 }
 

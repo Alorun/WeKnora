@@ -136,6 +136,9 @@ func newReranker(config *RerankerConfig) (Reranker, error) {
 	if providerName == "" {
 		providerName = provider.DetectProvider(config.BaseURL)
 	}
+	if err := provider.RequireCapability(providerName, provider.CapabilityRerank); err != nil {
+		return nil, err
+	}
 
 	var (
 		reranker Reranker

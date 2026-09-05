@@ -89,6 +89,9 @@ type anthropicStreamEvent struct {
 }
 
 func NewAnthropicChat(config *ChatConfig) (*AnthropicChat, error) {
+	if err := provider.RequireCapability(provider.ProviderAnthropic, provider.CapabilityChat); err != nil {
+		return nil, err
+	}
 	if config.BaseURL != "" {
 		if err := secutils.ValidateURLForSSRF(config.BaseURL); err != nil {
 			return nil, fmt.Errorf("baseURL SSRF check failed: %w", err)

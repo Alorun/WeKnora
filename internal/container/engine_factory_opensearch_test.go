@@ -9,6 +9,7 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
+	appretriever "github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/types"
 )
@@ -96,9 +97,17 @@ func TestInitRetrieveEngineRegistry_OpenSearchEnvPath(t *testing.T) {
 
 	// nil store repository and engine factory: this exercises the env-driver
 	// path, which never rebuilds a database-backed store.
-	registry, err := initRetrieveEngineRegistry(db, &config.Config{}, &fakeAuditSvc{}, nil, nil)
+	drivers := appretriever.NewDriverGate()
+	registry, err := initRetrieveEngineRegistry(db, &config.Config{}, &fakeAuditSvc{}, nil, nil, drivers)
 	if err != nil {
 		t.Fatalf("initRetrieveEngineRegistry: %v", err)
+	}
+	if _, err := registry.GetRetrieveEngineService(types.OpenSearchRetrieverEngineType); err == nil {
+		t.Fatal("env engine was published before PluginManager lifecycle start")
+	}
+	if err := registry.(*appretriever.RetrieveEngineRegistry).
+		PublishDriver(types.OpenSearchRetrieverEngineType); err != nil {
+		t.Fatalf("publish opensearch driver: %v", err)
 	}
 	if _, err := registry.GetRetrieveEngineService(types.OpenSearchRetrieverEngineType); err != nil {
 		t.Errorf("opensearch engine not registered via env path: %v", err)

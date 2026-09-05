@@ -100,6 +100,7 @@ type StreamingConnector interface {
 type ConnectorRegistry struct {
 	mu         sync.RWMutex
 	connectors map[string]Connector
+	declared   map[string]Connector
 	external   ExternalConnectorResolver
 }
 
@@ -136,11 +137,31 @@ type ExternalRevisionIngestor interface {
 func NewConnectorRegistry() *ConnectorRegistry {
 	return &ConnectorRegistry{
 		connectors: make(map[string]Connector),
+		declared:   make(map[string]Connector),
 	}
 }
 
-// Register registers a connector with the registry
+// Register retains the legacy declaration entry point. It deliberately does
+// not publish a connector to requests; PluginManager publishes through
+// Publish after the builtin runtime passes health checks.
 func (r *ConnectorRegistry) Register(connector Connector) error {
+	if connector == nil {
+		return ErrConnectorNil
+	}
+	if connector.Type() == "" {
+		return ErrConnectorTypeEmpty
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.declared[connector.Type()]; exists {
+		return ErrConnectorDuplicate
+	}
+	r.declared[connector.Type()] = connector
+	return nil
+}
+
+// Publish makes a connector available to new business requests.
+func (r *ConnectorRegistry) Publish(connector Connector) error {
 	if connector == nil {
 		return ErrConnectorNil
 	}

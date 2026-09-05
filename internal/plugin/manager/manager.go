@@ -17,7 +17,6 @@ import (
 
 var (
 	ErrNotFound            = errors.New("plugin is not managed")
-	ErrDisableNotAllowed   = errors.New("plugin cannot be disabled")
 	ErrRuntimeNotAvailable = errors.New("runtime_not_available")
 )
 
@@ -43,6 +42,7 @@ type PluginManager struct {
 	statuses            map[control.PluginID]control.PluginStatus
 	hostVersion         string
 	now                 func() time.Time
+	builtinRuntime      builtin.Runtime
 	runtime             pluginruntime.Runtime
 	handles             map[string]pluginruntime.RuntimeHandle
 	handleInstallations map[string]string
@@ -60,6 +60,7 @@ func NewWithVersion(pluginCatalog *catalog.Catalog, external ExternalStore, host
 		statuses:            make(map[control.PluginID]control.PluginStatus),
 		hostVersion:         hostVersion,
 		now:                 time.Now,
+		builtinRuntime:      builtin.NewBuiltinRuntime(),
 		handles:             make(map[string]pluginruntime.RuntimeHandle),
 		handleInstallations: make(map[string]string),
 	}
@@ -139,6 +140,10 @@ func (m *PluginManager) Start(ctx context.Context, id control.PluginID) error {
 		return nil
 	}
 	if managed.published {
+		if err := m.builtinRuntime.Health(ctx, managed.descriptor); err != nil {
+			m.setBuiltinStatus(managed, control.StateDegraded, err.Error())
+			return err
+		}
 		if err := managed.descriptor.Registrar.Health(ctx); err != nil {
 			m.setBuiltinStatus(managed, control.StateDegraded, err.Error())
 			return err
@@ -147,17 +152,18 @@ func (m *PluginManager) Start(ctx context.Context, id control.PluginID) error {
 		return nil
 	}
 	m.setBuiltinStatus(managed, control.StateStarting, "")
-	if managed.descriptor.Start != nil {
-		if err := managed.descriptor.Start(ctx); err != nil {
-			m.setBuiltinStatus(managed, control.StateFailed, err.Error())
-			return err
-		}
+	if err := m.builtinRuntime.Start(ctx, managed.descriptor); err != nil {
+		startErr := errors.Join(err, m.builtinRuntime.Stop(context.WithoutCancel(ctx), managed.descriptor))
+		m.setBuiltinStatus(managed, control.StateFailed, startErr.Error())
+		return startErr
+	}
+	if err := m.builtinRuntime.Health(ctx, managed.descriptor); err != nil {
+		startErr := errors.Join(err, m.builtinRuntime.Stop(context.WithoutCancel(ctx), managed.descriptor))
+		m.setBuiltinStatus(managed, control.StateFailed, startErr.Error())
+		return startErr
 	}
 	if err := managed.descriptor.Registrar.Publish(ctx); err != nil {
-		startErr := err
-		if managed.descriptor.Stop != nil {
-			startErr = errors.Join(startErr, managed.descriptor.Stop(ctx))
-		}
+		startErr := errors.Join(err, m.builtinRuntime.Stop(context.WithoutCancel(ctx), managed.descriptor))
 		m.setBuiltinStatus(managed, control.StateFailed, startErr.Error())
 		return startErr
 	}
@@ -168,10 +174,8 @@ func (m *PluginManager) Start(ctx context.Context, id control.PluginID) error {
 			startErr = errors.Join(startErr, unpublishErr)
 		} else {
 			managed.published = false
-			if managed.descriptor.Stop != nil {
-				startErr = errors.Join(startErr, managed.descriptor.Stop(ctx))
-			}
 		}
+		startErr = errors.Join(startErr, m.builtinRuntime.Stop(context.WithoutCancel(ctx), managed.descriptor))
 		m.setBuiltinStatus(managed, control.StateFailed, startErr.Error())
 		return startErr
 	}
@@ -186,10 +190,18 @@ func (m *PluginManager) Stop(ctx context.Context, id control.PluginID) error {
 	if !exists {
 		return fmt.Errorf("%s: %w", id, ErrNotFound)
 	}
-	if !managed.descriptor.AllowDisable {
-		return fmt.Errorf("%s: %w", id, ErrDisableNotAllowed)
-	}
 	return m.stopLocked(ctx, managed)
+}
+
+// StopAll stops builtins in reverse deterministic order. It is safe to call
+// repeatedly and is used by process shutdown as well as startup rollback.
+func (m *PluginManager) StopAll(ctx context.Context) error {
+	ids := m.builtinIDs()
+	var stopErr error
+	for index := len(ids) - 1; index >= 0; index-- {
+		stopErr = errors.Join(stopErr, m.Stop(ctx, ids[index]))
+	}
+	return stopErr
 }
 
 func (m *PluginManager) Health(ctx context.Context, id control.PluginID) control.PluginStatus {
@@ -200,7 +212,9 @@ func (m *PluginManager) Health(ctx context.Context, id control.PluginID) control
 		return control.PluginStatus{PluginID: id, State: control.StateNotReady, LastError: ErrNotFound.Error(), UpdatedAt: m.now()}
 	}
 	if managed.status.State == control.StateReady || managed.status.State == control.StateDegraded {
-		if err := managed.descriptor.Registrar.Health(ctx); err != nil {
+		if err := m.builtinRuntime.Health(ctx, managed.descriptor); err != nil {
+			m.setBuiltinStatus(managed, control.StateDegraded, err.Error())
+		} else if err := managed.descriptor.Registrar.Health(ctx); err != nil {
 			m.setBuiltinStatus(managed, control.StateDegraded, err.Error())
 		} else {
 			m.setBuiltinStatus(managed, control.StateReady, "")
@@ -495,11 +509,9 @@ func (m *PluginManager) stopLocked(ctx context.Context, managed *managedBuiltin)
 		}
 		managed.published = false
 	}
-	if managed.descriptor.Stop != nil {
-		if err := managed.descriptor.Stop(ctx); err != nil {
-			m.setBuiltinStatus(managed, control.StateFailed, err.Error())
-			return err
-		}
+	if err := m.builtinRuntime.Stop(ctx, managed.descriptor); err != nil {
+		m.setBuiltinStatus(managed, control.StateFailed, err.Error())
+		return err
 	}
 	m.setBuiltinStatus(managed, control.StateStopped, "")
 	return nil

@@ -51,6 +51,9 @@ func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
 	if providerName == "" {
 		providerName = provider.DetectProvider(chatConfig.BaseURL)
 	}
+	if err := provider.RequireCapability(providerName, provider.CapabilityChat); err != nil {
+		return nil, err
+	}
 
 	var config openai.ClientConfig
 	if providerName == provider.ProviderAzureOpenAI {

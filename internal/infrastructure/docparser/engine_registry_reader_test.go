@@ -41,6 +41,13 @@ func TestNewReaderRoutesByEngine(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewReader: %v", err)
 			}
+			for { // Inspect the selected implementation behind lifecycle routing.
+				managed, ok := reader.(*activeEngineReader)
+				if !ok {
+					break
+				}
+				reader = managed.inner
+			}
 			if _, isSimple := tc.want.(*SimpleFormatReader); isSimple {
 				if _, ok := reader.(*SimpleFormatReader); !ok {
 					t.Fatalf("reader = %T, want *SimpleFormatReader", reader)
@@ -60,6 +67,38 @@ func TestNewReaderReportsDisconnectedDocReader(t *testing.T) {
 	if _, err := NewReader(context.Background(), BuiltinEngineName, "docx", false, ReaderDeps{}); err == nil {
 		t.Fatal("NewReader succeeded without a docreader connection, want an error")
 	}
+}
+
+func TestManagedFallbackRejectsStoppedBridge(t *testing.T) {
+	remote := &recordingDocReader{}
+	reader := managedFallbackReader(BuiltinEngineName, remote)
+	if reader == nil {
+		t.Fatal("managed fallback was not built for a ready bridge")
+	}
+	if err := UnregisterEngine(BuiltinEngineName); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, engine := range BuiltinEngineRegistrations() {
+			if engine.Name() == BuiltinEngineName {
+				_ = PublishEngine(engine)
+				return
+			}
+		}
+	})
+	if _, err := reader.Read(context.Background(), &types.ReadRequest{}); err == nil {
+		t.Fatal("fallback invoked a stopped DocReader bridge")
+	}
+	if remote.calls != 0 {
+		t.Fatalf("stopped bridge received %d calls", remote.calls)
+	}
+}
+
+type recordingDocReader struct{ calls int }
+
+func (r *recordingDocReader) Read(context.Context, *types.ReadRequest) (*types.ReadResult, error) {
+	r.calls++
+	return &types.ReadResult{}, nil
 }
 
 func TestNewReaderRequiresWeKnoraCloudCredentials(t *testing.T) {
@@ -82,7 +121,7 @@ func TestAnydocEngineFollowsBuildAvailability(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewReader: %v", err)
 		}
-		if _, ok := reader.(*AnydocReader); !ok {
+		if _, ok := reader.(*activeEngineReader).inner.(*AnydocReader); !ok {
 			t.Fatalf("reader = %T, want *AnydocReader", reader)
 		}
 		return

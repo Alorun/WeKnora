@@ -56,10 +56,18 @@ func newMock(engineType types.RetrieverEngineType) interfaces.RetrieveEngineServ
 	return &mockEngineService{engineType: engineType}
 }
 
+func publishDrivers(t *testing.T, reg *RetrieveEngineRegistry, engineTypes ...types.RetrieverEngineType) {
+	t.Helper()
+	for _, engineType := range engineTypes {
+		require.NoError(t, reg.PublishDriver(engineType))
+	}
+}
+
 // --- Register (byEngineType) tests ---
 
 func TestRegistry_Register(t *testing.T) {
 	reg := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	publishDrivers(t, reg, types.PostgresRetrieverEngineType)
 
 	t.Run("success", func(t *testing.T) {
 		err := reg.Register(newMock(types.PostgresRetrieverEngineType))
@@ -75,6 +83,7 @@ func TestRegistry_Register(t *testing.T) {
 
 func TestRegistry_GetRetrieveEngineService(t *testing.T) {
 	reg := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	publishDrivers(t, reg, types.PostgresRetrieverEngineType, types.QdrantRetrieverEngineType)
 	_ = reg.Register(newMock(types.PostgresRetrieverEngineType))
 
 	t.Run("found", func(t *testing.T) {
@@ -92,6 +101,7 @@ func TestRegistry_GetRetrieveEngineService(t *testing.T) {
 
 func TestRegistry_GetAllRetrieveEngineServices(t *testing.T) {
 	reg := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	publishDrivers(t, reg, types.PostgresRetrieverEngineType, types.ElasticsearchRetrieverEngineType)
 	_ = reg.Register(newMock(types.PostgresRetrieverEngineType))
 	_ = reg.Register(newMock(types.ElasticsearchRetrieverEngineType))
 
@@ -111,6 +121,7 @@ func TestRegistry_GetAllRetrieveEngineServices(t *testing.T) {
 
 func TestRegistry_RegisterWithStoreID(t *testing.T) {
 	reg := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	publishDrivers(t, reg, types.PostgresRetrieverEngineType, types.ElasticsearchRetrieverEngineType)
 
 	t.Run("success", func(t *testing.T) {
 		reg.RegisterWithStoreID("store-1", newMock(types.PostgresRetrieverEngineType))
@@ -141,6 +152,7 @@ func TestRegistry_RegisterWithStoreID(t *testing.T) {
 
 func TestRegistry_GetByStoreID(t *testing.T) {
 	reg := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	publishDrivers(t, reg, types.PostgresRetrieverEngineType)
 	reg.RegisterWithStoreID("store-1", newMock(types.PostgresRetrieverEngineType))
 
 	t.Run("found", func(t *testing.T) {
@@ -158,6 +170,7 @@ func TestRegistry_GetByStoreID(t *testing.T) {
 
 func TestRegistry_UnregisterByStoreID(t *testing.T) {
 	reg := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	publishDrivers(t, reg, types.PostgresRetrieverEngineType)
 	reg.RegisterWithStoreID("store-1", newMock(types.PostgresRetrieverEngineType))
 
 	t.Run("removes registered store", func(t *testing.T) {
@@ -175,6 +188,7 @@ func TestRegistry_UnregisterByStoreID(t *testing.T) {
 
 func TestRegistry_DualMapIsolation(t *testing.T) {
 	reg := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	publishDrivers(t, reg, types.PostgresRetrieverEngineType, types.ElasticsearchRetrieverEngineType)
 
 	_ = reg.Register(newMock(types.PostgresRetrieverEngineType))
 	reg.RegisterWithStoreID("store-pg", newMock(types.PostgresRetrieverEngineType))
@@ -202,6 +216,7 @@ func TestRegistry_DualMapIsolation(t *testing.T) {
 
 func TestRegistry_ConcurrentAccess(t *testing.T) {
 	reg := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	publishDrivers(t, reg, types.PostgresRetrieverEngineType)
 	const goroutines = 10
 
 	var wg sync.WaitGroup

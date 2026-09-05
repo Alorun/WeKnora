@@ -22,23 +22,25 @@ type ProviderFactory func(params types.WebSearchProviderParameters) (interfaces.
 // It maps provider type IDs (e.g., "bing", "google") to their factory functions.
 // Instances are created on-demand with tenant-specific parameters.
 type Registry struct {
-	factories map[string]ProviderFactory
-	mu        sync.RWMutex
+	factories    map[string]ProviderFactory
+	declarations map[string]ProviderFactory
+	mu           sync.RWMutex
 }
 
 // NewRegistry creates a new web search provider registry
 func NewRegistry() *Registry {
 	return &Registry{
-		factories: make(map[string]ProviderFactory),
+		factories:    make(map[string]ProviderFactory),
+		declarations: make(map[string]ProviderFactory),
 	}
 }
 
-// Register retains the legacy direct-publish signature. Production builtin
-// wiring uses Publish through PluginManager so the two paths never run together.
+// Register retains the legacy signature as declaration-only compatibility.
+// It cannot make a provider callable before PluginManager starts it.
 func (r *Registry) Register(id string, factory ProviderFactory) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.factories[id] = factory
+	r.declarations[id] = factory
 }
 
 // Publish registers a provider type factory with duplicate validation.

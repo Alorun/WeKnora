@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 
+	appretriever "github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	websearch "github.com/Tencent/WeKnora/internal/infrastructure/web_search"
 	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/Tencent/WeKnora/internal/plugin/control"
+	"github.com/Tencent/WeKnora/internal/types"
 )
 
 type Registrar interface {
@@ -19,14 +21,50 @@ type Registrar interface {
 	Health(context.Context) error
 }
 
+type preflightRegistrar interface {
+	Preflight(context.Context) error
+}
+
 type Hook func(context.Context) error
 
 type BuiltinDescriptor struct {
-	Definition   control.PluginDefinition
-	AllowDisable bool
-	Start        Hook
-	Stop         Hook
-	Registrar    Registrar
+	Definition control.PluginDefinition
+	Start      Hook
+	Stop       Hook
+	Registrar  Registrar
+}
+
+// Runtime gives in-process extensions the same explicit runtime boundary as
+// external plugins without changing their implementation or transport.
+type Runtime interface {
+	Start(context.Context, BuiltinDescriptor) error
+	Health(context.Context, BuiltinDescriptor) error
+	Stop(context.Context, BuiltinDescriptor) error
+}
+
+type BuiltinRuntime struct{}
+
+func NewBuiltinRuntime() *BuiltinRuntime { return &BuiltinRuntime{} }
+
+func (*BuiltinRuntime) Start(ctx context.Context, descriptor BuiltinDescriptor) error {
+	if descriptor.Start == nil {
+		return nil
+	}
+	return descriptor.Start(ctx)
+}
+
+func (*BuiltinRuntime) Health(ctx context.Context, descriptor BuiltinDescriptor) error {
+	if registrar, ok := descriptor.Registrar.(preflightRegistrar); ok {
+		return registrar.Preflight(ctx)
+	}
+	return nil
+}
+
+func (*BuiltinRuntime) Stop(ctx context.Context, descriptor BuiltinDescriptor) error {
+	if descriptor.Stop == nil {
+		return nil
+	}
+	return descriptor.Stop(ctx)
 }
 
 func (d BuiltinDescriptor) Validate() error {
@@ -47,11 +85,18 @@ type DataSourceRegistrar struct {
 	Connector datasource.Connector
 }
 
-func (r *DataSourceRegistrar) Publish(context.Context) error {
-	if r.Registry == nil || r.Connector == nil {
+func (r *DataSourceRegistrar) Preflight(context.Context) error {
+	if r.Registry == nil || r.Connector == nil || r.Connector.Type() == "" {
 		return errors.New("datasource registrar is incomplete")
 	}
-	if err := r.Registry.Register(r.Connector); err != nil {
+	if _, exists := datasource.ConnectorMetadataRegistry[r.Connector.Type()]; !exists {
+		return fmt.Errorf("connector metadata %q is not declared", r.Connector.Type())
+	}
+	return nil
+}
+
+func (r *DataSourceRegistrar) Publish(context.Context) error {
+	if err := r.Registry.Publish(r.Connector); err != nil {
 		return err
 	}
 	if err := datasource.PublishConnectorMetadata(r.Connector.Type()); err != nil {
@@ -86,6 +131,13 @@ type ParserRegistrar struct {
 	Engine docparser.EngineRegistration
 }
 
+func (r *ParserRegistrar) Preflight(context.Context) error {
+	if r.Engine == nil || r.Engine.Name() == "" || !docparser.IsEngineDeclared(r.Engine.Name()) {
+		return errors.New("parser registrar is incomplete")
+	}
+	return nil
+}
+
 func (r *ParserRegistrar) Publish(context.Context) error {
 	return docparser.PublishEngine(r.Engine)
 }
@@ -107,6 +159,13 @@ type WebSearchRegistrar struct {
 	Factory  websearch.ProviderFactory
 }
 
+func (r *WebSearchRegistrar) Preflight(context.Context) error {
+	if r.Registry == nil || r.ID == "" || r.Factory == nil {
+		return errors.New("web search registrar is incomplete")
+	}
+	return nil
+}
+
 func (r *WebSearchRegistrar) Publish(context.Context) error {
 	if r.Registry == nil {
 		return errors.New("web search registry is required")
@@ -125,11 +184,15 @@ func (r *WebSearchRegistrar) Health(context.Context) error {
 	return nil
 }
 
-// ModelRegistrar controls metadata/config-validation routing. The compiled chat,
-// embedding and rerank adapters remain core code, so production descriptors are
-// deliberately non-disableable.
 type ModelRegistrar struct {
 	Provider provider.Provider
+}
+
+func (r *ModelRegistrar) Preflight(context.Context) error {
+	if r.Provider == nil || r.Provider.Info().Name == "" || !provider.IsDeclared(r.Provider.Info().Name) {
+		return errors.New("model registrar is incomplete")
+	}
+	return nil
 }
 
 func (r *ModelRegistrar) Publish(context.Context) error {
@@ -145,5 +208,48 @@ func (r *ModelRegistrar) Health(context.Context) error {
 	if !exists || registered != r.Provider {
 		return fmt.Errorf("model provider %q is not published", r.Provider.Info().Name)
 	}
+	for _, capability := range provider.CapabilitiesFor(r.Provider.Info()) {
+		if !provider.HasCapability(r.Provider.Info().Name, capability) {
+			return fmt.Errorf("model provider %q capability %q is not published", r.Provider.Info().Name, capability)
+		}
+	}
 	return nil
 }
+
+// RetrievalRegistry is the lifecycle surface implemented by the existing
+// retrieval engine registry. Business interfaces remain unchanged.
+type RetrievalRegistry interface {
+	SupportsDriver(types.RetrieverEngineType) bool
+	PublishDriver(types.RetrieverEngineType) error
+	UnpublishDriver(types.RetrieverEngineType) error
+	IsDriverPublished(types.RetrieverEngineType) bool
+}
+
+type RetrievalRegistrar struct {
+	Registry   RetrievalRegistry
+	EngineType types.RetrieverEngineType
+}
+
+func (r *RetrievalRegistrar) Preflight(context.Context) error {
+	if r.Registry == nil || !r.Registry.SupportsDriver(r.EngineType) {
+		return fmt.Errorf("retrieval driver %q is not supported", r.EngineType)
+	}
+	return nil
+}
+
+func (r *RetrievalRegistrar) Publish(context.Context) error {
+	return r.Registry.PublishDriver(r.EngineType)
+}
+
+func (r *RetrievalRegistrar) Unpublish(context.Context) error {
+	return r.Registry.UnpublishDriver(r.EngineType)
+}
+
+func (r *RetrievalRegistrar) Health(context.Context) error {
+	if !r.Registry.IsDriverPublished(r.EngineType) {
+		return fmt.Errorf("retrieval driver %q is not published", r.EngineType)
+	}
+	return nil
+}
+
+var _ RetrievalRegistry = (*appretriever.RetrieveEngineRegistry)(nil)

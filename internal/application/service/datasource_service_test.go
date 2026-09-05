@@ -426,7 +426,7 @@ func newSyncDeletionHarness(
 	}
 	syncLogRepo := &processSyncSyncLogRepo{logs: map[string]*types.SyncLog{syncLog.ID: syncLog}}
 	registry := datasource.NewConnectorRegistry()
-	require.NoError(t, registry.Register(deletedItemConnector{}))
+	require.NoError(t, registry.Publish(deletedItemConnector{}))
 
 	return &syncDeletionHarness{
 		ds:            ds,
@@ -665,7 +665,7 @@ func TestProcessSync_SyncDeletionsPartialWhenMixedResults(t *testing.T) {
 	ks := &sweepFakeKS{repo: repo}
 	syncLogRepo := &processSyncSyncLogRepo{logs: map[string]*types.SyncLog{syncLog.ID: syncLog}}
 	registry := datasource.NewConnectorRegistry()
-	require.NoError(t, registry.Register(mixedSyncConnector{}))
+	require.NoError(t, registry.Publish(mixedSyncConnector{}))
 
 	svc := &DataSourceService{
 		dsRepo:            newKBDeleteDSRepo(ds.KnowledgeBaseID, ds),

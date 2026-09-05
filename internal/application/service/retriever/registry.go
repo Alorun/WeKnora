@@ -2,6 +2,7 @@ package retriever
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync"
@@ -36,9 +37,12 @@ const rebuildCooldown = 30 * time.Second
 //
 // Implements both interfaces.RetrieveEngineRegistry and interfaces.StoreRegistry.
 type RetrieveEngineRegistry struct {
-	byEngineType map[types.RetrieverEngineType]interfaces.RetrieveEngineService
-	byStoreID    map[string]interfaces.RetrieveEngineService
-	mu           sync.RWMutex
+	byEngineType         map[types.RetrieverEngineType]interfaces.RetrieveEngineService
+	byStoreID            map[string]interfaces.RetrieveEngineService
+	declaredByEngineType map[types.RetrieverEngineType]interfaces.RetrieveEngineService
+	declaredByStoreID    map[string]interfaces.RetrieveEngineService
+	driverGate           *DriverGate
+	mu                   sync.RWMutex
 
 	// repo and factory let the registry rebuild an engine that is missing from
 	// byStoreID. Both are optional: when either is nil the registry cannot
@@ -87,7 +91,10 @@ func (r *RetrieveEngineRegistry) registerIfGenUnchanged(
 	if r.storeGen[storeID] != gen {
 		return false
 	}
-	r.byStoreID[storeID] = svc
+	if svc == nil || !r.driverGate.IsActive(svc.EngineType()) {
+		return false
+	}
+	r.byStoreID[storeID] = r.driverGate.Guard(svc)
 	delete(r.failedUntil, storeID)
 	return true
 }
@@ -122,13 +129,25 @@ func (r *RetrieveEngineRegistry) markBuildFailed(storeID string) {
 func NewRetrieveEngineRegistry(
 	repo interfaces.VectorStoreRepository, factory interfaces.EngineFactory,
 ) interfaces.RetrieveEngineRegistry {
+	return NewRetrieveEngineRegistryWithGate(repo, factory, NewDriverGate())
+}
+
+func NewRetrieveEngineRegistryWithGate(
+	repo interfaces.VectorStoreRepository, factory interfaces.EngineFactory, gate *DriverGate,
+) *RetrieveEngineRegistry {
+	if gate == nil {
+		gate = NewDriverGate()
+	}
 	return &RetrieveEngineRegistry{
-		byEngineType: make(map[types.RetrieverEngineType]interfaces.RetrieveEngineService),
-		byStoreID:    make(map[string]interfaces.RetrieveEngineService),
-		storeGen:     make(map[string]uint64),
-		failedUntil:  make(map[string]time.Time),
-		repo:         repo,
-		factory:      factory,
+		byEngineType:         make(map[types.RetrieverEngineType]interfaces.RetrieveEngineService),
+		byStoreID:            make(map[string]interfaces.RetrieveEngineService),
+		declaredByEngineType: make(map[types.RetrieverEngineType]interfaces.RetrieveEngineService),
+		declaredByStoreID:    make(map[string]interfaces.RetrieveEngineService),
+		driverGate:           gate,
+		storeGen:             make(map[string]uint64),
+		failedUntil:          make(map[string]time.Time),
+		repo:                 repo,
+		factory:              factory,
 	}
 }
 
@@ -137,15 +156,90 @@ func NewRetrieveEngineRegistry(
 // Register registers a retrieval engine service by engine type.
 // Returns an error if the engine type is already registered.
 func (r *RetrieveEngineRegistry) Register(repo interfaces.RetrieveEngineService) error {
+	if repo == nil {
+		return errors.New("retrieval engine service is required")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Check while holding the registry lock so Stop cannot deactivate/remove
+	// the driver between this check and publication.
+	if err := r.driverGate.RequireActive(repo.EngineType()); err != nil {
+		return err
+	}
 
 	if _, exists := r.byEngineType[repo.EngineType()]; exists {
 		return fmt.Errorf("repository type %s already registered", repo.EngineType())
 	}
 
-	r.byEngineType[repo.EngineType()] = repo
+	r.byEngineType[repo.EngineType()] = r.driverGate.Guard(repo)
+	r.declaredByEngineType[repo.EngineType()] = repo
 	return nil
+}
+
+// Declare stages an env-configured engine without making it callable. The
+// matching RetrievalRegistrar publishes it when PluginManager starts.
+func (r *RetrieveEngineRegistry) Declare(repo interfaces.RetrieveEngineService) error {
+	if repo == nil {
+		return errors.New("retrieval engine service is required")
+	}
+	if !r.SupportsDriver(repo.EngineType()) {
+		return fmt.Errorf("%s: %w", repo.EngineType(), ErrDriverUnsupported)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.declaredByEngineType[repo.EngineType()]; exists {
+		return fmt.Errorf("repository type %s already declared", repo.EngineType())
+	}
+	r.declaredByEngineType[repo.EngineType()] = repo
+	return nil
+}
+
+func (r *RetrieveEngineRegistry) SupportsDriver(engineType types.RetrieverEngineType) bool {
+	return r.driverGate.Supports(engineType)
+}
+
+func (r *RetrieveEngineRegistry) PublishDriver(engineType types.RetrieverEngineType) error {
+	if !r.SupportsDriver(engineType) {
+		return fmt.Errorf("%s: %w", engineType, ErrDriverUnsupported)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.driverGate.IsActive(engineType) {
+		return nil
+	}
+	if err := r.driverGate.activate(engineType); err != nil {
+		return err
+	}
+	if svc := r.declaredByEngineType[engineType]; svc != nil {
+		r.byEngineType[engineType] = r.driverGate.Guard(svc)
+	}
+	for storeID, svc := range r.declaredByStoreID {
+		if svc != nil && svc.EngineType() == engineType {
+			r.byStoreID[storeID] = r.driverGate.Guard(svc)
+		}
+	}
+	return nil
+}
+
+func (r *RetrieveEngineRegistry) UnpublishDriver(engineType types.RetrieverEngineType) error {
+	if !r.SupportsDriver(engineType) {
+		return fmt.Errorf("%s: %w", engineType, ErrDriverUnsupported)
+	}
+	r.driverGate.deactivate(engineType)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.byEngineType, engineType)
+	for storeID, svc := range r.byStoreID {
+		if svc != nil && svc.EngineType() == engineType {
+			delete(r.byStoreID, storeID)
+			r.bumpGenerationLocked(storeID)
+		}
+	}
+	return nil
+}
+
+func (r *RetrieveEngineRegistry) IsDriverPublished(engineType types.RetrieverEngineType) bool {
+	return r.driverGate.IsActive(engineType)
 }
 
 // GetRetrieveEngineService retrieves a retrieval engine service by type.
@@ -153,6 +247,9 @@ func (r *RetrieveEngineRegistry) Register(repo interfaces.RetrieveEngineService)
 func (r *RetrieveEngineRegistry) GetRetrieveEngineService(repoType types.RetrieverEngineType) (
 	interfaces.RetrieveEngineService, error,
 ) {
+	if err := r.driverGate.RequireActive(repoType); err != nil {
+		return nil, err
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -172,7 +269,9 @@ func (r *RetrieveEngineRegistry) GetAllRetrieveEngineServices() []interfaces.Ret
 
 	result := make([]interfaces.RetrieveEngineService, 0, len(r.byEngineType))
 	for _, v := range r.byEngineType {
-		result = append(result, v)
+		if v != nil && r.driverGate.IsActive(v.EngineType()) {
+			result = append(result, v)
+		}
 	}
 
 	return result
@@ -188,10 +287,21 @@ func (r *RetrieveEngineRegistry) RegisterWithStoreID(storeID string, svc interfa
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.byStoreID[storeID] = svc
+	r.declaredByStoreID[storeID] = svc
+	if svc != nil && r.driverGate.IsActive(svc.EngineType()) {
+		r.byStoreID[storeID] = r.driverGate.Guard(svc)
+	}
 	// Count this alongside unregistrations: an on-demand build that started
 	// earlier must not overwrite the entry published here, which would leave
 	// the engine this call installed orphaned with its connections open.
+	r.bumpGenerationLocked(storeID)
+}
+
+// DeclareWithStoreID stages a startup-loaded DB store for later publication.
+func (r *RetrieveEngineRegistry) DeclareWithStoreID(storeID string, svc interfaces.RetrieveEngineService) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.declaredByStoreID[storeID] = svc
 	r.bumpGenerationLocked(storeID)
 }
 
@@ -213,6 +323,9 @@ func (r *RetrieveEngineRegistry) GetByStoreID(storeID string) (interfaces.Retrie
 	svc, exists := r.byStoreID[storeID]
 	if !exists {
 		return nil, fmt.Errorf("store %s not found in registry", storeID)
+	}
+	if err := r.driverGate.RequireActive(svc.EngineType()); err != nil {
+		return nil, err
 	}
 	return svc, nil
 }
@@ -295,6 +408,7 @@ func (r *RetrieveEngineRegistry) GetOrLoadByStoreID(
 				"[retriever.registry] engine factory returned no engine for store %s", storeID)
 			return nil, ErrVectorStoreUnavailable
 		}
+		svc = r.driverGate.Guard(svc)
 		if !r.registerIfGenUnchanged(storeID, gen, svc) {
 			// The entry changed while this engine was being built, so this one
 			// is stale before it is published. Whatever landed instead is
@@ -339,6 +453,7 @@ func (r *RetrieveEngineRegistry) UnregisterByStoreID(storeID string) {
 	defer r.mu.Unlock()
 
 	delete(r.byStoreID, storeID)
+	delete(r.declaredByStoreID, storeID)
 	r.bumpGenerationLocked(storeID)
 	// Let an operator retry immediately after removing a store rather than
 	// waiting out a cooldown left over from the previous configuration.

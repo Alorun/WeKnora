@@ -55,12 +55,12 @@ func (b *blockingFactory) build(ctx context.Context, _ types.VectorStore) (
 }
 
 func newRehydratingRegistry(factory interfaces.EngineFactory) *RetrieveEngineRegistry {
-	return &RetrieveEngineRegistry{
-		byEngineType: make(map[types.RetrieverEngineType]interfaces.RetrieveEngineService),
-		byStoreID:    make(map[string]interfaces.RetrieveEngineService),
-		repo:         &fakeStoreRepo{store: &types.VectorStore{ID: rehydrateStoreID}},
-		factory:      factory,
-	}
+	registry := NewRetrieveEngineRegistry(
+		&fakeStoreRepo{store: &types.VectorStore{ID: rehydrateStoreID}}, factory,
+	).(*RetrieveEngineRegistry)
+	_ = registry.PublishDriver(types.ElasticsearchRetrieverEngineType)
+	_ = registry.PublishDriver(types.PostgresRetrieverEngineType)
+	return registry
 }
 
 // TestGetOrLoadByStoreID_LeaderCancelDoesNotPoisonWaiters pins the reason this
@@ -241,10 +241,8 @@ func TestGetOrLoadByStoreID_FailedBuildEntersCooldown(t *testing.T) {
 // mode: a registry built without the rebuild dependencies must behave exactly
 // as it did before rehydration existed.
 func TestGetOrLoadByStoreID_WithoutRepoOrFactoryIsPlainLookup(t *testing.T) {
-	registry := &RetrieveEngineRegistry{
-		byEngineType: make(map[types.RetrieverEngineType]interfaces.RetrieveEngineService),
-		byStoreID:    make(map[string]interfaces.RetrieveEngineService),
-	}
+	registry := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	require.NoError(t, registry.PublishDriver(types.ElasticsearchRetrieverEngineType))
 
 	_, err := registry.GetOrLoadByStoreID(context.Background(), 1, rehydrateStoreID)
 	require.ErrorIs(t, err, ErrVectorStoreNotFound)
@@ -253,7 +251,7 @@ func TestGetOrLoadByStoreID_WithoutRepoOrFactoryIsPlainLookup(t *testing.T) {
 	registry.RegisterWithStoreID(rehydrateStoreID, registered)
 	svc, err := registry.GetOrLoadByStoreID(context.Background(), 1, rehydrateStoreID)
 	require.NoError(t, err)
-	assert.Same(t, registered, svc, "a hit must not consult the database")
+	assert.Same(t, registered, svc.(*managedEngine).RetrieveEngineService, "a hit must not consult the database")
 }
 
 // cancellingRegistry reports a caller-side cancellation from the rebuild path,
@@ -405,6 +403,6 @@ func TestGetOrLoadByStoreID_BuildDoesNotOverwriteAConcurrentRegistration(t *test
 
 	live, err := registry.GetByStoreID(rehydrateStoreID)
 	require.NoError(t, err)
-	assert.Same(t, registered, live,
+	assert.Same(t, registered, live.(*managedEngine).RetrieveEngineService,
 		"the engine published by the registration must survive the finishing build")
 }
