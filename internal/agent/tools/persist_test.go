@@ -235,7 +235,7 @@ func TestCompactToolOutputForHistory_failedSkillScriptKeepsStdout(t *testing.T) 
 	stdout := `{"chart":{"success":false,"error":{"error":"X轴字段不存在：工作项目","available":["name","value"]}}}`
 	output := "=== Script Execution: smart-charts/scripts/cli.py ===\n\n**Exit Code**: 1\n\n## Standard Output\n\n```\n" + stdout + "\n```\n"
 	errMsg := "Script exited with code 1\n\n[Analyze the error above and try a different approach.]"
-	history := CompactToolOutputForHistory(ToolExecuteSkillScript, &types.ToolResult{
+	history := CompactToolOutputForHistory(LegacyToolExecuteSkillScript, &types.ToolResult{
 		Success: false,
 		Output:  output,
 		Error:   errMsg,
@@ -259,7 +259,7 @@ func TestSanitizeAgentStepsForStorage_skillScriptKeepsStreamsOnFailure(t *testin
 	output := "=== Script Execution: smart-charts/scripts/cli.py ===\n\n" + stdout
 	steps := []types.AgentStep{{
 		ToolCalls: []types.ToolCall{{
-			Name: ToolExecuteSkillScript,
+			Name: LegacyToolExecuteSkillScript,
 			Result: &types.ToolResult{
 				Success: false,
 				Output:  output,
@@ -313,5 +313,38 @@ func TestCompactToolOutputForHistory_editSandboxFileKeepsPath(t *testing.T) {
 	})
 	if history != "Edited /workspace/output/generate_ppt.py (1 replacement(s), 12345 bytes)" {
 		t.Fatalf("history should keep path, replacements, and size, got %q", history)
+	}
+}
+
+func TestCompactToolOutputForHistory_writeSandboxFileIncludesDiffStat(t *testing.T) {
+	history := CompactToolOutputForHistory(ToolWriteSandboxFile, &types.ToolResult{
+		Success: true,
+		Data: map[string]interface{}{
+			"display_type":  ToolWriteSandboxFile,
+			"path":          "/workspace/output/a.py",
+			"size":          80,
+			"added_lines":   12,
+			"removed_lines": 0,
+		},
+	})
+	if history != "Wrote /workspace/output/a.py (+12, 80 bytes)" {
+		t.Fatalf("history should include +N, got %q", history)
+	}
+}
+
+func TestCompactToolOutputForHistory_editSandboxFileIncludesDiffStat(t *testing.T) {
+	history := CompactToolOutputForHistory(ToolEditSandboxFile, &types.ToolResult{
+		Success: true,
+		Data: map[string]interface{}{
+			"display_type":  ToolEditSandboxFile,
+			"path":          "/workspace/output/a.py",
+			"size":          80,
+			"replacements":  2,
+			"added_lines":   5,
+			"removed_lines": 3,
+		},
+	})
+	if history != "Edited /workspace/output/a.py (+5 -3, 2 replacement(s), 80 bytes)" {
+		t.Fatalf("history should include +/- and replacements, got %q", history)
 	}
 }

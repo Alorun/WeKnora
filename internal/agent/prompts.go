@@ -79,7 +79,7 @@ type PinnedMCPServiceInfo struct {
 	ToolNames   []string // Registered tool.function names for this service (mcp_{service}_{tool})
 }
 
-// PinnedSkillInfo describes a preloaded skill explicitly @mentioned for this turn.
+// PinnedSkillInfo describes a skill explicitly @mentioned for this turn.
 type PinnedSkillInfo struct {
 	Name        string
 	Description string
@@ -233,58 +233,47 @@ func formatSkillsMetadata(skillsMetadata []*skills.SkillMetadata, shellExecEnabl
 	if len(skillsMetadata) == 0 {
 		return ""
 	}
+	var b strings.Builder
+	b.WriteString("\n\nAvailable skills: read a relevant skill's listed SKILL.md resource with read_file before applying it. Load additional files only as needed; the returned file list already identifies bundled scripts.\n")
+	for _, skill := range skillsMetadata {
+		if skill != nil {
+			fmt.Fprintf(&b, "- %s: %s (read_file path=%q)\n", skill.Name, skill.Description, "skill://"+skill.Name+"/SKILL.md")
+		}
+	}
+	return b.String()
+}
 
-	var builder strings.Builder
-	builder.WriteString("\n### Available Skills (IMPORTANT - READ CAREFULLY)\n\n")
-	builder.WriteString("**You MUST actively consider using these skills for EVERY user request.**\n\n")
-
-	builder.WriteString("#### Skill Matching Protocol (MANDATORY)\n\n")
-	builder.WriteString("Before responding to ANY user query, follow this checklist:\n\n")
-	builder.WriteString("1. **SCAN**: Read each skill's description and trigger conditions below\n")
-	builder.WriteString("2. **MATCH**: Check if the user's intent matches ANY skill's triggers (keywords, scenarios, or task types)\n")
-	builder.WriteString("3. **LOAD**: If a match is found, call `read_skill(skill_name=\"...\")` BEFORE generating your response\n")
-	builder.WriteString("4. **APPLY**: Follow the skill's instructions to provide a higher-quality, structured response\n\n")
-
-	builder.WriteString("**⚠️ CRITICAL**: Skill usage is MANDATORY when applicable. Do NOT skip skills to save time or tokens.\n\n")
-
-	builder.WriteString("#### Available Skills\n\n")
-	for i, skill := range skillsMetadata {
-		builder.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, skill.Name))
-		builder.WriteString(fmt.Sprintf("   %s\n\n", skill.Description))
+// formatToolGuidance uses the actual registry, so disabled capabilities never
+// leak into the runtime instructions. Mechanics and limits live in tool schemas.
+func formatToolGuidance(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	has := func(name string) bool {
+		for _, n := range names {
+			if n == name {
+				return true
+			}
+		}
+		return false
+	}
+	var b strings.Builder
+	b.WriteString("\n\nTool execution: use only the tools provided for this turn. Plan internally; use a planning tool only when it helps. Read known paths directly. Batch independent reads; keep dependent operations in order. Inspect results before claiming completion.\n")
+	b.WriteString("For long-running operations, prefer a documented asynchronous mode when available. Use the returned task ID to wait or poll at the recommended interval and retrieve the completed result; after a timeout, check the existing task before resubmitting.\n")
+	b.WriteString("On failure, use the reported cause to correct the input or environment. Retry only after something relevant changes. Permission, policy, or missing-configuration failures are not fixed by switching tools; report the concrete blocker if it cannot be corrected within this session.\n")
+	if has("read_file") {
+		b.WriteString("Use read_file for workspace files and listed skill:// resources. In older instructions, translate read_skill(skill_name, file_path) to read_file(path=skill://<name>/<file_path or SKILL.md>) and read_sandbox_file to read_file.\n")
+	}
+	if has("shell_exec") || has("write_sandbox_file") {
+		b.WriteString("Session workspace: /workspace. Preserve uploaded originals in /workspace/input; create scratch files under /workspace and deliverables under /workspace/output. Commands start from their specified working directory on every call. Files and installed packages persist within the session.\n")
+		b.WriteString(sandboxArtifactReferenceGuidance())
+	}
+	if has("shell_exec") && has("read_file") {
+		b.WriteString("For listed skills, run bundled scripts and your own scripts with shell_exec(skill_name=..., command=...). This selects an installed skill's runtime or stages host skill resources, and applies scoped credentials; use $WEKNORA_SKILL_DIR for bundled files. The installed tree is read-only.\n")
+		b.WriteString("In older instructions, translate execute_skill_script(skill_name, script_path, ...) to shell_exec(skill_name=..., command=...).\n")
 	}
 
-	builder.WriteString("#### Tool Reference\n\n")
-	builder.WriteString("- `read_skill(skill_name)`: Load SKILL.md **and** list the skill's files. This is how you discover scripts — do not `list_sandbox_files` or `ls` `/opt/weknora/tenant/skills/...`\n")
-	builder.WriteString("- `read_skill(skill_name, file_path)`: Read one file inside the skill (`file_path` is relative, e.g. `scripts/generate_ppt.py`)\n")
-	builder.WriteString("- `execute_skill_script(skill_name, script_path, args, input)`: Run a skill script with that skill's interpreter and packages\n")
-	builder.WriteString("  - `script_path`: relative inside the skill (`scripts/foo.py`), or an absolute `/workspace/...` file from `write_sandbox_file` / `edit_sandbox_file` (not `/workspace/input`)\n")
-	builder.WriteString("  - `input`: Pass data directly via stdin (use this when you have data in memory, e.g. JSON string)\n")
-	builder.WriteString("  - `args`: Command-line arguments; pass absolute `/workspace/input/...` paths from `<sandbox_attachments>` for user-uploaded files\n")
-	builder.WriteString("  - Treat `/workspace/input` as read-only and write generated files only to `$WEKNORA_SKILL_OUTPUT_DIR`\n")
-	builder.WriteString(sandboxArtifactReferenceGuidance())
-	builder.WriteString("  - Each skill keeps its dependencies to itself (virtualenv or node_modules); ")
-	builder.WriteString("this tool already runs scripts the right way. A bare `python3 -c` / `node -e` ")
-	builder.WriteString("sees none of them, so never conclude from that that a skill cannot run. ")
-	builder.WriteString("The skill tree is frozen after install — do not run install_deps.py, ")
-	builder.WriteString("chown, ensurepip, or pip into `/opt/weknora/tenant/skills`. ")
-	builder.WriteString("On-demand extras: `python3 -m pip install --target /workspace/.skill-packages/<skill> <package>`, ")
-	builder.WriteString("then execute_skill_script; or ask the user to reinstall the skill so extras are baked in\n")
-	if shellExecEnabled {
-		builder.WriteString("- `shell_exec(command, work_dir, timeout_sec, max_output_bytes, max_stderr_bytes, env)`: Freely execute shell commands and explore the current session's isolated Cube sandbox\n")
-		builder.WriteString("  - User-uploaded files are restored under `/workspace/input` and listed in `<sandbox_attachments>`\n")
-		builder.WriteString("  - Use `find` and `ls` to discover files; use `cat`, `head`, `tail`, and `sed` to inspect text; use `grep` and `awk` to search and process content; use `file` for an unknown type\n")
-		builder.WriteString("  - Do not `ls` / `find` / `cat` / `file` a skill under `/opt/weknora/tenant/skills` to discover scripts. `read_skill(skill_name)` already lists them; that tree also contains `.venv` / `node_modules`\n")
-		builder.WriteString("  - Use shell pipelines, redirects, scripts, package managers, compilers, and other installed commands whenever they are the most direct way to complete the task\n")
-		builder.WriteString("  - Do not inspect skill-generated office files with `python3 -c` (system Python has no python-docx/pptx). Write a short script with `write_sandbox_file` and run it with `execute_skill_script`; do not paste the same code into `.venv/bin/python -c`\n")
-		builder.WriteString("  - To change a few lines of a file you already wrote, call `edit_sandbox_file` instead of rewriting the whole file\n")
-		builder.WriteString("  - Python strings: never nest ASCII `\"` inside `\"...\"` (or `'` inside `'...'`). Use the other quote, and 「」 for Chinese quotation\n")
-		builder.WriteString("  - Increase `max_output_bytes` up to 65536 per stream for large text output, or use `sed`/`head`/`tail` for targeted sections\n")
-		builder.WriteString("  - Binary output is suppressed; write binary results under `/workspace/output` so ArtifactCollector attaches them for download\n")
-		builder.WriteString("  - Session state persists across later `shell_exec` and `execute_skill_script` calls\n")
-		builder.WriteString("  - Non-zero exit codes are normal results, not tool errors — inspect stderr and decide what to do next\n")
-	}
-
-	return builder.String()
+	return b.String()
 }
 
 // sandboxArtifactReferenceGuidance tells the model how to point at a file it
@@ -296,7 +285,7 @@ func formatSkillsMetadata(skillsMetadata []*skills.SkillMetadata, shellExecEnabl
 // so the server can bind the name to the artifact index it hands the client.
 func sandboxArtifactReferenceGuidance() string {
 	var builder strings.Builder
-	builder.WriteString("  - To show a generated file inside your answer, reference it as ")
+	builder.WriteString("  - Include key generated deliverables in your final answer as ")
 	builder.WriteString("`![description](sandbox:<file name>)` using the exact file name and no directory path\n")
 	builder.WriteString("    - Images render inline; charts, tables, and documents ")
 	builder.WriteString("render as a card the user clicks to preview\n")
@@ -340,6 +329,7 @@ func renderPromptPlaceholdersWithStatus(
 
 // BuildSystemPromptOptions contains optional parameters for BuildSystemPrompt
 type BuildSystemPromptOptions struct {
+	SelectedTools    []string
 	SkillsMetadata   []*skills.SkillMetadata
 	ShellExecEnabled bool
 	Language         string         // User language name for {{language}} placeholder (e.g. "Chinese (Simplified)")
@@ -383,12 +373,19 @@ func BuildSystemPromptWithOptions(
 		template = GetProgressiveRAGSystemPrompt(cfg)
 	}
 
-	currentTime := time.Now().Format(time.RFC3339)
+	currentTime := time.Now().Format("2006-01-02")
 	language := ""
 	if options != nil {
 		language = options.Language
 	}
 	basePrompt = renderPromptPlaceholdersWithStatus(template, knowledgeBases, webSearchEnabled, currentTime, language)
+
+	if options != nil {
+		basePrompt += formatGroundingGuidance(options.SelectedTools)
+		basePrompt += formatToolGuidance(options.SelectedTools)
+	} else {
+		basePrompt += formatGroundingGuidance(nil)
+	}
 
 	// Append skills metadata if available (Level 1 - Progressive Disclosure)
 	if options != nil && len(options.SkillsMetadata) > 0 {

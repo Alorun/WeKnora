@@ -3,6 +3,9 @@
     <Transition name="modal">
       <div v-if="visible" class="settings-overlay" @click.self="handleClose">
         <div class="settings-modal">
+          <div v-if="editorInitializing" class="editor-initializing" role="status" :aria-label="$t('common.loading')">
+            <t-loading size="medium" :text="$t('common.loading')" />
+          </div>
           <!-- 关闭按钮 -->
           <button class="close-btn" @click="handleClose" :aria-label="$t('common.close')">
             <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
@@ -703,14 +706,19 @@
                       </div>
                     </div>
 
-                    <!-- 最大迭代次数（Agent 模式） -->
+                    <!-- 最大迭代次数（Agent 模式）：正数为上限，-1 为不限制 -->
                     <div v-if="isAgentMode" class="setting-row">
                       <div class="setting-info">
                         <label>{{ $t('agent.editor.maxIterations') }}</label>
                         <p class="desc">{{ $t('agentEditor.desc.maxIterations') }}</p>
                       </div>
-                      <div class="setting-control">
-                        <t-input-number v-model="formData.config.max_iterations" :min="1" :max="50" theme="column" />
+                      <div class="setting-control max-tokens-control">
+                        <t-radio-group v-model="maxIterationsMode">
+                          <t-radio-button value="limit">{{ $t('agent.editor.maxIterationsLimit') }}</t-radio-button>
+                          <t-radio-button value="unlimited">{{ $t('agent.editor.maxIterationsUnlimited') }}</t-radio-button>
+                        </t-radio-group>
+                        <t-input-number v-if="maxIterationsMode === 'limit'" v-model="formData.config.max_iterations"
+                          :min="2" :max="50" theme="column" />
                       </div>
                     </div>
 
@@ -1777,6 +1785,7 @@
                     $t('common.cancel')
                     }}</t-button>
                   <t-button v-if="!props.readOnly" theme="primary" data-guide="agent-create-submit" :loading="saving"
+                    :disabled="editorInitializing"
                     @click="handleSave">{{
                     saveButtonLabel
                     }}</t-button>
@@ -2014,6 +2023,7 @@ onBeforeUnmount(() => {
 })
 
 const saving = ref(false);
+const editorInitializing = ref(false);
 const allModels = ref<ModelConfig[]>([]);
 const kbOptions = ref<{ label: string; value: string; type?: 'document' | 'faq'; count?: number; shared?: boolean; orgName?: string; ragEnabled?: boolean; wikiEnabled?: boolean; capabilities?: KBCapabilities }[]>([]);
 
@@ -2347,7 +2357,7 @@ const defaultMaxCompletionTokensFor = (mode: string, sandboxConfigId?: string) =
 };
 
 // 知识库相关工具列表（用于 watch(hasKnowledgeBase) 从"无"变"有"时 seed 默认工具）
-const knowledgeBaseTools = ['grep_chunks', 'knowledge_search', 'list_knowledge_chunks', 'query_knowledge_graph', 'get_document_info', 'database_query'];
+const knowledgeBaseTools = ['grep_chunks', 'knowledge_search', 'list_knowledge_chunks', 'get_document_info'];
 
 // Wiki 读取类工具（用于 watch(agentMode) 切到 smart-reasoning 时 seed 默认工具）
 const wikiReadTools = ['wiki_search', 'wiki_read_page', 'wiki_read_source_doc', 'wiki_flag_issue'];
@@ -2877,6 +2887,22 @@ const maxCompletionTokensMode = computed({
   },
 });
 
+const lastFiniteMaxIterations = ref(10);
+const maxIterationsMode = computed({
+  get: () => (formData.value.config.max_iterations < 0 ? 'unlimited' : 'limit'),
+  set: (mode: 'limit' | 'unlimited') => {
+    if (mode === 'unlimited') {
+      if (formData.value.config.max_iterations > 1) {
+        lastFiniteMaxIterations.value = formData.value.config.max_iterations;
+      }
+      formData.value.config.max_iterations = -1;
+      return;
+    }
+    const restored = lastFiniteMaxIterations.value > 1 ? lastFiniteMaxIterations.value : 10;
+    formData.value.config.max_iterations = restored;
+  },
+});
+
 const currentIntentTemplate = computed(() =>
   intentPromptTemplates.value.find((template) => template.id === selectedIntent.value),
 );
@@ -3358,13 +3384,19 @@ const needsRerankModel = computed(() => {
   return false;
 });
 
+let editorInitializationGeneration = 0;
+
 // 监听可见性变化，重置表单
 watch(() => props.visible, async (val) => {
+  const generation = ++editorInitializationGeneration;
   if (val) {
+    editorInitializing.value = true;
+    try {
     savedAgent.value = null;
     currentSection.value = resolveEditorSection(props.initialSection);
     // 先加载依赖数据（包括默认配置）
     await loadDependencies();
+    if (generation !== editorInitializationGeneration || !props.visible) return;
 
     if (props.mode === 'edit' && props.agent) {
       // 深度复制对象以避免引用问题
@@ -3415,13 +3447,16 @@ watch(() => props.visible, async (val) => {
 
       // 兼容旧数据：如果没有 agent_mode 字段，根据 allowed_tools 推断
       if (!agentData.config.agent_mode) {
-        const isAgent = agentData.config.max_iterations > 1 || (agentData.config.allowed_tools && agentData.config.allowed_tools.length > 0);
+        const isAgent = agentData.config.max_iterations < 0 || agentData.config.max_iterations > 1 || (agentData.config.allowed_tools && agentData.config.allowed_tools.length > 0);
         agentData.config.agent_mode = isAgent ? 'smart-reasoning' : 'quick-answer';
       }
 
       // 设置初始化标志，防止 watch 自动添加工具
       isInitializing.value = true;
       formData.value = agentData;
+      if (agentData.config.max_iterations > 1) {
+        lastFiniteMaxIterations.value = agentData.config.max_iterations;
+      }
       // 初始化知识库选择模式
       initKbSelectionMode();
       initMcpSelectionMode();
@@ -3502,11 +3537,21 @@ watch(() => props.visible, async (val) => {
     }
 
     await syncInstalledSkills()
+    if (generation !== editorInitializationGeneration || !props.visible) return;
 
     if (props.initialHighlightField) {
       await applyInitialFieldHighlight(props.initialHighlightField);
+      if (generation !== editorInitializationGeneration || !props.visible) return;
+    }
+    } catch (error) {
+      console.error('Failed to initialize agent editor', error);
+    } finally {
+      if (generation === editorInitializationGeneration && props.visible) {
+        editorInitializing.value = false;
+      }
     }
   } else {
+    editorInitializing.value = false;
     clearFieldHighlight();
     agentIMChannelCount.value = 0;
     agentEmbedChannelCount.value = 0;
@@ -3674,21 +3719,14 @@ watch(agentMode, (val, _oldVal) => {
     if (formData.value.config.allowed_tools.length === 0) {
       const tools: string[] = [];
       if (hasRagKnowledgeBase.value) {
-        tools.push(
-          'knowledge_search',
-          'grep_chunks',
-          'list_knowledge_chunks',
-          'query_knowledge_graph',
-          'get_document_info',
-          'database_query',
-        );
+        tools.push(...knowledgeBaseTools);
       }
       if (hasWikiKnowledgeBase.value) {
         tools.push(...wikiReadTools);
       }
       formData.value.config.allowed_tools = tools;
     }
-    if (formData.value.config.max_iterations <= 1) {
+    if (formData.value.config.max_iterations >= 0 && formData.value.config.max_iterations <= 1) {
       formData.value.config.max_iterations = 10;
     }
     // 切换到 Agent 模式时，如果系统提示词是快速问答的默认值或为空，替换为 Agent 默认提示词
@@ -3783,6 +3821,12 @@ watch(() => uiStore.showSettingsModal, async (visible, prevVisible) => {
     } catch (e) {
       console.warn('Failed to refresh data after settings closed', e);
     }
+  }
+});
+
+watch(() => chatResources.allModels, (list) => {
+  if (props.visible) {
+    allModels.value = list;
   }
 });
 
@@ -4825,6 +4869,16 @@ const handleSave = async () => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.editor-initializing {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--td-bg-color-container);
 }
 
 .close-btn {

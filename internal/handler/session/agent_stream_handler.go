@@ -116,6 +116,7 @@ func (h *AgentStreamHandler) Subscribe() {
 	h.eventBus.On(event.EventAgentToolResult, h.handleToolResult)
 	h.eventBus.On(event.EventAgentReferences, h.handleReferences)
 	h.eventBus.On(event.EventMemoryRecalled, h.handleMemoryRecalled)
+	h.eventBus.On(event.EventContextCompacted, h.handleContextCompacted)
 	h.eventBus.On(event.EventAgentFinalAnswer, h.handleFinalAnswer)
 	h.eventBus.On(event.EventAgentReflection, h.handleReflection)
 	h.eventBus.On(event.EventError, h.handleError)
@@ -183,27 +184,29 @@ func (h *AgentStreamHandler) handleToolCall(ctx context.Context, evt event.Event
 	}
 
 	h.mu.Lock()
-	// Track start time for this tool call (use tool_call_id as key)
-	h.eventStartTimes[data.ToolCallID] = time.Now()
-	// Any answer text streamed before this tool call was a non-terminal round's
-	// preamble, not the final answer (the agent only ends by stopping naturally
-	// with plain text and no tool calls). Drop those segments from the persisted
-	// answer so the preamble never leaks into Message.Content.
-	supersededAny := false
-	for _, seg := range h.answerSegments {
-		if !seg.superseded && seg.content != "" {
-			seg.superseded = true
-			supersededAny = true
+	_, first := h.eventStartTimes[data.ToolCallID]
+	if !first {
+		h.eventStartTimes[data.ToolCallID] = time.Now()
+		// Any answer text streamed before this tool call was a non-terminal round's
+		// preamble, not the final answer (the agent only ends by stopping naturally
+		// with plain text and no tool calls). Drop those segments from the persisted
+		// answer so the preamble never leaks into Message.Content.
+		supersededAny := false
+		for _, seg := range h.answerSegments {
+			if !seg.superseded && seg.content != "" {
+				seg.superseded = true
+				supersededAny = true
+			}
 		}
-	}
-	if supersededAny {
-		h.finalAnswer = h.composeFinalAnswer()
+		if supersededAny {
+			h.finalAnswer = h.composeFinalAnswer()
+		}
 	}
 	h.mu.Unlock()
 
 	metadata := map[string]interface{}{
 		"tool_name":    data.ToolName,
-		"arguments":    data.Arguments,
+		"arguments":    agenttools.SanitizeSandboxFileCallArgs(data.ToolName, data.Arguments),
 		"tool_call_id": data.ToolCallID,
 	}
 
@@ -457,6 +460,39 @@ func (h *AgentStreamHandler) handleMemoryRecalled(ctx context.Context, evt event
 	return nil
 }
 
+// handleContextCompacted forwards a compaction to the UI.
+//
+// The summary itself is carried so the user can expand it and see exactly what
+// the agent kept, which is the only way to tell an agent that forgot something
+// from an agent that never had it.
+func (h *AgentStreamHandler) handleContextCompacted(_ context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.ContextCompactedData)
+	if !ok {
+		return nil
+	}
+
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeContextCompacted,
+		Done:      true,
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"reason":          data.Reason,
+			"round":           data.Round,
+			"tokens_before":   data.TokensBefore,
+			"tokens_after":    data.TokensAfter,
+			"messages_before": data.MessagesBefore,
+			"messages_after":  data.MessagesAfter,
+			"summary":         data.Summary,
+			"degraded":        data.Degraded,
+			"split_turn":      data.SplitTurn,
+		},
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append context compacted event to stream failed", "error", err)
+	}
+	return nil
+}
+
 // handleFinalAnswer handles final answer events
 func (h *AgentStreamHandler) handleFinalAnswer(ctx context.Context, evt event.Event) error {
 	data, ok := evt.Data.(event.AgentFinalAnswerData)
@@ -657,6 +693,7 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 		// persisted without artifacts. Collect is a no-op when either the
 		// collector wasn't wired in, no sandbox is bound, or no files were
 		// produced — those cases must not disturb the completion path.
+		var previous types.MessageArtifacts
 		if h.artifactCollector != nil {
 			collectCtx := context.WithoutCancel(h.ctx)
 			artifacts, err := h.artifactCollector.CollectWithNotify(
@@ -686,7 +723,11 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 					len(artifacts), h.assistantMessageID, h.sessionID,
 				)
 			}
+			previous = h.artifactCollector.ReferencedHistory(collectCtx, h.sessionID,
+				h.assistantMessageID, h.assistantMessage.Content)
 		}
+		h.assistantMessage.Content = types.ClarifyArtifactVersions(h.assistantMessage.Content,
+			h.assistantMessage.Artifacts, previous, types.LanguageFromContextOrDefault(h.ctx))
 	}
 
 	// Fallback: if no answer events were streamed but we have a final answer,
@@ -733,6 +774,7 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 	completeData := map[string]interface{}{
 		"total_steps":       data.TotalSteps,
 		"total_duration_ms": data.TotalDurationMs,
+		"final_content":     h.assistantMessage.Content,
 	}
 	// Attach the freshly-collected artifacts so the frontend can render the
 	// download button without waiting for a page refresh. We strip the

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -163,27 +162,28 @@ func dataKeys(data map[string]interface{}) []string {
 
 // toolDisplayNames maps internal tool names to user-friendly display labels.
 var toolDisplayNames = map[string]string{
-	agenttools.ToolThinking:            "深度思考",
-	agenttools.ToolTodoWrite:           "制定计划",
-	agenttools.ToolGrepChunks:          "关键词搜索",
-	agenttools.ToolKnowledgeSearch:     "知识搜索",
-	agenttools.ToolListKnowledgeChunks: "查看文档分块",
-	agenttools.ToolQueryKnowledgeGraph: "查询知识图谱",
-	agenttools.ToolGetDocumentInfo:     "获取文档信息",
-	agenttools.ToolSearchConversations: "回顾历史对话",
-	agenttools.ToolSearchMemory:        "查询长期记忆",
-	agenttools.ToolDatabaseQuery:       "查询数据",
-	agenttools.ToolDataAnalysis:        "数据分析",
-	agenttools.ToolDataSchema:          "查看数据结构",
-	agenttools.ToolWebSearch:           "搜索网页",
-	agenttools.ToolWebFetch:            "获取网页",
-	agenttools.ToolExecuteSkillScript:  "执行技能脚本",
-	agenttools.ToolReadSkill:           "读取技能",
-	agenttools.ToolListSandboxFiles:    "列出沙箱文件",
-	agenttools.ToolReadSandboxFile:     "读取沙箱文件",
-	agenttools.ToolWriteSandboxFile:    "写入沙箱文件",
-	agenttools.ToolEditSandboxFile:     "编辑沙箱文件",
-	agenttools.ToolShellExec:           "执行沙箱命令",
+	agenttools.ToolThinking:                 "深度思考",
+	agenttools.ToolTodoWrite:                "制定计划",
+	agenttools.ToolGrepChunks:               "关键词搜索",
+	agenttools.ToolKnowledgeSearch:          "知识搜索",
+	agenttools.ToolListKnowledgeChunks:      "查看文档分块",
+	agenttools.ToolQueryKnowledgeGraph:      "查询知识图谱",
+	agenttools.ToolGetDocumentInfo:          "获取文档信息",
+	agenttools.ToolSearchConversations:      "回顾历史对话",
+	agenttools.ToolSearchMemory:             "查询长期记忆",
+	agenttools.ToolDatabaseQuery:            "查询数据",
+	agenttools.ToolDataAnalysis:             "数据分析",
+	agenttools.ToolDataSchema:               "查看数据结构",
+	agenttools.ToolWebSearch:                "搜索网页",
+	agenttools.ToolWebFetch:                 "获取网页",
+	agenttools.LegacyToolExecuteSkillScript: "执行技能脚本",
+	agenttools.LegacyToolReadSkill:          "读取技能",
+	agenttools.ToolReadFile:                 "读取文件",
+	agenttools.ToolListSandboxFiles:         "列出沙箱文件",
+	agenttools.LegacyToolReadSandboxFile:    "读取沙箱文件",
+	agenttools.ToolWriteSandboxFile:         "写入沙箱文件",
+	agenttools.ToolEditSandboxFile:          "编辑沙箱文件",
+	agenttools.ToolShellExec:                "执行沙箱命令",
 }
 
 // toolHintSensitiveArgs lists tools whose arguments should NOT be shown in hints
@@ -227,6 +227,19 @@ func (e *AgentEngine) executeToolCalls(
 
 	round := iteration + 1
 	n := len(response.ToolCalls)
+
+	// A completion-token cap cuts the response mid-serialization, so every call
+	// in it may carry incomplete arguments. Running them is worse than failing
+	// them: a truncated write_sandbox_file lands a half-written file and still
+	// reports success, which the model only discovers by reading the file back.
+	if isLengthFinishReason(response.FinishReason) {
+		logger.Warnf(ctx, "[Agent][Round-%d] Response hit the completion-token cap (finish=%s); "+
+			"refusing %d tool call(s) with possibly truncated arguments",
+			round, response.FinishReason, n)
+		e.failTruncatedToolCalls(ctx, response, step, iteration, sessionID)
+		return
+	}
+
 	logger.Infof(ctx, "[Agent][Round-%d] Executing %d tool call(s)", round, n)
 
 	// Use parallel execution when enabled and there are multiple tool calls
@@ -238,31 +251,34 @@ func (e *AgentEngine) executeToolCalls(
 	for i, tc := range response.ToolCalls {
 		e.executeSingleToolCall(ctx, tc, i, step, iteration, round, sessionID, assistantMessageID)
 	}
-	annotateLengthTruncatedToolErrors(response.FinishReason, step.ToolCalls)
 }
 
-// truncatedOutputHint explains a failed tool call that the provider cut off at
-// the completion-token cap. It stays tool-neutral: any tool can be the one that
-// got truncated, and naming another tool's fields would send the model chasing
-// arguments the failing call does not have.
-const truncatedOutputHint = "\n\nThe previous model output was cut off at the completion-token limit " +
-	"(finish_reason=length), so these arguments are incomplete rather than wrong. " +
-	"Retry with a complete JSON object and a smaller payload."
+// truncatedArgumentsError is handed to the model instead of a tool result when
+// the arguments were cut off. It stays tool-neutral: any tool can be the one
+// that got truncated, and naming another tool's fields would send the model
+// chasing arguments the failing call does not have.
+const truncatedArgumentsError = "Tool call was not executed: the model output was cut off " +
+	"before the arguments finished, so they are incomplete rather than wrong. " +
+	"Re-issue the call with a complete JSON object. If the payload is large, " +
+	"split it across several smaller calls."
 
-// annotateLengthTruncatedToolErrors appends that explanation to every failed
-// result in the round. Results carry a pointer, so mutating through the slice
-// reaches the caller's tool calls.
-func annotateLengthTruncatedToolErrors(finishReason string, toolCalls []types.ToolCall) {
-	if !isLengthFinishReason(finishReason) {
-		return
-	}
-	for i := range toolCalls {
-		result := toolCalls[i].Result
-		if result == nil || result.Success ||
-			strings.Contains(result.Error, "finish_reason=length") {
-			continue
+// failTruncatedToolCalls records every call in a truncated response as failed
+// without running any of them, emitting the same events a real execution would
+// so the UI and the transcript stay consistent.
+func (e *AgentEngine) failTruncatedToolCalls(
+	ctx context.Context, response *types.ChatResponse,
+	step *types.AgentStep, iteration int, sessionID string,
+) {
+	for i, tc := range response.ToolCalls {
+		toolCall := types.ToolCall{
+			ID:               agenttools.NormalizeToolCallID(tc.ID, tc.Function.Name, i),
+			Name:             tc.Function.Name,
+			Args:             map[string]any{"_raw": tc.Function.Arguments},
+			ProviderMetadata: tc.ProviderMetadata,
+			Result:           &types.ToolResult{Success: false, Error: truncatedArgumentsError},
 		}
-		result.Error += truncatedOutputHint
+		step.ToolCalls = append(step.ToolCalls, toolCall)
+		e.emitToolOutcome(ctx, toolCall, iteration, sessionID)
 	}
 }
 
@@ -279,11 +295,22 @@ func (e *AgentEngine) executeToolCallsParallel(
 	results := make([]types.ToolCall, n)
 	var mu sync.Mutex
 	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(8)
 
 	for i, tc := range response.ToolCalls {
 		i, tc := i, tc // capture loop vars
+		if !agenttools.CanRunConcurrently(tc.Function.Name) {
+			// Drain preceding reads before a mutation, and finish the mutation
+			// before starting later reads. Preserve model order across barriers.
+			_ = g.Wait()
+			results[i] = e.runToolCall(ctx, tc, i, iteration, round, sessionID, assistantMessageID)
+			g, gCtx = errgroup.WithContext(ctx)
+			g.SetLimit(8)
+			continue
+		}
+		readCtx := gCtx
 		g.Go(func() error {
-			toolCall := e.runToolCall(gCtx, tc, i, iteration, round, sessionID, assistantMessageID)
+			toolCall := e.runToolCall(readCtx, tc, i, iteration, round, sessionID, assistantMessageID)
 			mu.Lock()
 			results[i] = toolCall
 			mu.Unlock()
@@ -292,58 +319,20 @@ func (e *AgentEngine) executeToolCallsParallel(
 	}
 
 	_ = g.Wait()
-	annotateLengthTruncatedToolErrors(response.FinishReason, results)
 
 	// Append results and emit events in original order
 	for _, toolCall := range results {
 		step.ToolCalls = append(step.ToolCalls, toolCall)
-
-		result := toolCall.Result
-		if result == nil {
-			result = &types.ToolResult{Success: false, Error: "no result"}
-		}
-
-		e.eventBus.Emit(ctx, event.Event{
-			ID:        toolCall.ID + "-tool-result",
-			Type:      event.EventAgentToolResult,
-			SessionID: sessionID,
-			Data: event.AgentToolResultData{
-				ToolCallID: toolCall.ID,
-				ToolName:   toolCall.Name,
-				Output:     result.Output,
-				Error:      result.Error,
-				Success:    result.Success,
-				Duration:   toolCall.Duration,
-				Iteration:  iteration,
-				Data:       agenttools.SanitizeToolDataForPersist(toolCall.Name, result.Data),
-			},
-		})
-
-		e.eventBus.Emit(ctx, event.Event{
-			ID:        toolCall.ID + "-tool-exec",
-			Type:      event.EventAgentTool,
-			SessionID: sessionID,
-			Data: event.AgentActionData{
-				Iteration:  iteration,
-				ToolName:   toolCall.Name,
-				ToolInput:  toolCall.Args,
-				ToolOutput: result.Output,
-				Success:    result.Success,
-				Error:      result.Error,
-				Duration:   toolCall.Duration,
-			},
-		})
+		e.emitToolOutcome(ctx, toolCall, iteration, sessionID)
 	}
 }
 
-// executeSingleToolCall runs one tool call sequentially (original behavior).
-func (e *AgentEngine) executeSingleToolCall(
-	ctx context.Context, tc types.LLMToolCall, i int,
-	step *types.AgentStep, iteration, round int, sessionID, assistantMessageID string,
+// emitToolOutcome publishes the result and action events for one finished tool
+// call. Every path that produces a ToolCall goes through here — sequential,
+// parallel, and refused-as-truncated — so the UI sees one event shape.
+func (e *AgentEngine) emitToolOutcome(
+	ctx context.Context, toolCall types.ToolCall, iteration int, sessionID string,
 ) {
-	toolCall := e.runToolCall(ctx, tc, i, iteration, round, sessionID, assistantMessageID)
-	step.ToolCalls = append(step.ToolCalls, toolCall)
-
 	result := toolCall.Result
 	if result == nil {
 		result = &types.ToolResult{Success: false, Error: "no result"}
@@ -381,6 +370,16 @@ func (e *AgentEngine) executeSingleToolCall(
 	})
 }
 
+// executeSingleToolCall runs one tool call sequentially (original behavior).
+func (e *AgentEngine) executeSingleToolCall(
+	ctx context.Context, tc types.LLMToolCall, i int,
+	step *types.AgentStep, iteration, round int, sessionID, assistantMessageID string,
+) {
+	toolCall := e.runToolCall(ctx, tc, i, iteration, round, sessionID, assistantMessageID)
+	step.ToolCalls = append(step.ToolCalls, toolCall)
+	e.emitToolOutcome(ctx, toolCall, iteration, sessionID)
+}
+
 // runToolCall handles argument parsing, execution, logging, and pipeline events for a single tool call.
 // It returns the completed ToolCall struct. Safe to call from multiple goroutines.
 func (e *AgentEngine) runToolCall(
@@ -395,7 +394,7 @@ func (e *AgentEngine) runToolCall(
 	var args map[string]any
 	argsStr := tc.Function.Arguments
 	if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
-		repaired := agenttools.RepairJSON(argsStr)
+		repaired, truncated := agenttools.RepairJSONDetail(argsStr)
 		if repairErr := json.Unmarshal([]byte(repaired), &args); repairErr != nil {
 			logger.Errorf(ctx, "%s Failed to parse arguments (repair failed): %v", toolTag, err)
 			return types.ToolCall{
@@ -411,6 +410,23 @@ func (e *AgentEngine) runToolCall(
 						"Retry with complete JSON (required fields first) and a smaller payload.\n\n" +
 						"[Analyze the error above and try a different approach.]",
 				},
+			}
+		}
+		// Closing off an unterminated string or bracket makes the payload
+		// parse, but the values inside are still the partial ones the provider
+		// managed to emit. Executing that writes half a file or searches half a
+		// query, and the tool reports success either way — so refuse instead.
+		// This is the belt for streams that break without a finish reason,
+		// where the length check in executeToolCalls has nothing to match on.
+		if truncated {
+			logger.Warnf(ctx, "%s Arguments were cut off mid-emission (%d bytes); refusing to execute",
+				toolTag, len(argsStr))
+			return types.ToolCall{
+				ID:               tc.ID,
+				Name:             tc.Function.Name,
+				Args:             map[string]any{"_raw": argsStr},
+				ProviderMetadata: tc.ProviderMetadata,
+				Result:           &types.ToolResult{Success: false, Error: truncatedArgumentsError},
 			}
 		}
 		logger.Warnf(ctx, "%s Repaired malformed JSON arguments", toolTag)
@@ -452,7 +468,7 @@ func (e *AgentEngine) runToolCall(
 		Data: event.AgentToolCallData{
 			ToolCallID: tc.ID,
 			ToolName:   tc.Function.Name,
-			Arguments:  args,
+			Arguments:  agenttools.SanitizeSandboxFileCallArgs(tc.Function.Name, args),
 			Iteration:  iteration,
 			Hint:       toolHint,
 		},

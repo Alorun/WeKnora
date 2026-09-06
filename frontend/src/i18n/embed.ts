@@ -260,6 +260,18 @@ const messages = {
       "think": "思考",
       "copy": "复制",
       "addToKnowledgeBase": "添加到知识库",
+      "artifactDrawer": {
+        "buttonTitle": "查看本次生成的文件",
+        "title": "生成的文件",
+        "empty": "本次未生成可下载的文件",
+        "preview": "预览",
+        "previewBack": "返回列表",
+        "collecting": "正在保存生成的文件…",
+        "download": "下载",
+        "downloadFailed": "下载失败，请稍后重试",
+        "inlinePreviewHint": "点击预览",
+        "inlineMissing": "文件不可用"
+      },
       "updatePlan": "更新计划",
       "webSearchFound": "找到 <strong>{count}</strong> 个网络搜索结果",
       "argumentsLabel": "参数",
@@ -355,7 +367,8 @@ const messages = {
         "truncated": "列表已截断",
         "wrote": "已写入",
         "edited": "已编辑",
-        "replacements": "替换 {count} 处"
+        "replacements": "替换 {count} 处",
+        "moreLines": "另有 {count} 行"
       },
       "shellExec": {
         "workDir": "目录",
@@ -786,6 +799,18 @@ const messages = {
       "think": "Thinking",
       "copy": "Copy",
       "addToKnowledgeBase": "Add to Knowledge Base",
+      "artifactDrawer": {
+        "buttonTitle": "View files generated in this reply",
+        "title": "Generated files",
+        "empty": "No downloadable files were generated this turn.",
+        "preview": "Preview",
+        "previewBack": "Back to list",
+        "collecting": "Saving generated files…",
+        "download": "Download",
+        "downloadFailed": "Download failed, please retry.",
+        "inlinePreviewHint": "Click to preview",
+        "inlineMissing": "File unavailable"
+      },
       "updatePlan": "Update Plan",
       "webSearchFound": "Found <strong>{count}</strong> web search result(s)",
       "argumentsLabel": "Arguments",
@@ -881,7 +906,8 @@ const messages = {
         "truncated": "List truncated",
         "wrote": "Wrote",
         "edited": "Edited",
-        "replacements": "Replaced {count}"
+        "replacements": "Replaced {count}",
+        "moreLines": "{count} more lines"
       },
       "shellExec": {
         "workDir": "Directory",

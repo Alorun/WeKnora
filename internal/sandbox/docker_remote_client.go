@@ -360,7 +360,8 @@ var dockerInitProcess = true
 // RemoteNetworkPolicy cannot be honoured here; the one thing that maps
 // cleanly is "no egress at all", which AllowInternetAccess=false expresses.
 // Domain rules are silently not applied — the config surface refuses them
-// before they get this far (see RequireCompleteConfig).
+// before they get this far (see types.ValidateSandboxNetworkPolicy, which
+// rejects any allow/deny list or L7 rule on a docker config at save time).
 func (c *DockerRemoteClient) networkMode(policy RemoteNetworkPolicy) string {
 	if policy.AllowInternetAccess != nil && !*policy.AllowInternetAccess {
 		return "none"
@@ -377,8 +378,11 @@ func (c *DockerRemoteClient) networkMode(policy RemoteNetworkPolicy) string {
 // left off instead of losing everything it installed.
 func (c *DockerRemoteClient) Connect(
 	ctx context.Context,
-	sandboxID string,
+	request RemoteConnectRequest,
 ) (RemoteSandboxHandle, error) {
+	// Docker containers are not fronted by a provider gateway, so there is no
+	// inbound credential to restore; TrafficAccessToken is ignored.
+	sandboxID := request.SandboxID
 	inspected, err := c.api.ContainerInspect(ctx, sandboxID, client.ContainerInspectOptions{})
 	if err != nil {
 		return nil, dockerError("Connect", err)
@@ -792,7 +796,7 @@ func dockerExecCommand(req RemoteExecRequest, timeout time.Duration) []string {
 	if req.Shell {
 		return []string{
 			"/bin/sh", "-c",
-			touch + `exec timeout -s KILL ` + seconds + ` /bin/sh -c "$1"`,
+			touch + `exec timeout -s KILL ` + seconds + ` /bin/bash --noprofile --norc -c "$1"`,
 			"weknora-exec", req.Command,
 		}
 	}
@@ -873,7 +877,7 @@ func (c *DockerRemoteClient) WriteFile(
 		Command: "sh",
 		Args:    []string{"-c", `cat > "$1"`, "weknora-write", clean},
 		Stdin:   string(content),
-		User:    DefaultSandboxExecUser,
+		User:    remoteFileUser(ctx),
 		Timeout: dockerFilesystemOpTimeout,
 	})
 	if err != nil {
@@ -908,7 +912,7 @@ func (c *DockerRemoteClient) ReadFile(
 	result, err := c.Exec(ctx, &dockerSandboxHandle{id: id}, RemoteExecRequest{
 		Command: "cat",
 		Args:    []string{"--", clean},
-		User:    DefaultSandboxExecUser,
+		User:    remoteFileUser(ctx),
 		Timeout: dockerFilesystemOpTimeout,
 	})
 	if err != nil {
@@ -952,7 +956,7 @@ func (c *DockerRemoteClient) Stat(
 			clean, "-maxdepth", "0",
 			"-printf", `%y\t%s\t%T@\t%p\n`,
 		},
-		User:    DefaultSandboxExecUser,
+		User:    remoteFileUser(ctx),
 		Timeout: dockerFilesystemOpTimeout,
 	})
 	if err != nil {
@@ -1020,7 +1024,7 @@ func (c *DockerRemoteClient) makeDir(ctx context.Context, id, dir, op string) er
 	result, err := c.Exec(ctx, &dockerSandboxHandle{id: id}, RemoteExecRequest{
 		Command: "mkdir",
 		Args:    []string{"-p", dir},
-		User:    DefaultSandboxExecUser,
+		User:    remoteFileUser(ctx),
 		Timeout: dockerFilesystemOpTimeout,
 	})
 	if err != nil {
@@ -1057,7 +1061,7 @@ func (c *DockerRemoteClient) Remove(
 	result, err := c.Exec(ctx, &dockerSandboxHandle{id: id}, RemoteExecRequest{
 		Command: "rm",
 		Args:    []string{"-rf", clean},
-		User:    DefaultSandboxExecUser,
+		User:    remoteFileUser(ctx),
 		Timeout: dockerFilesystemOpTimeout,
 	})
 	if err != nil {
@@ -1098,7 +1102,7 @@ func (c *DockerRemoteClient) ListDir(
 			clean, "-mindepth", "1", "-maxdepth", "1",
 			"-printf", `%y\t%s\t%T@\t%p\n`,
 		},
-		User:    DefaultSandboxExecUser,
+		User:    remoteFileUser(ctx),
 		Timeout: dockerFilesystemOpTimeout,
 	})
 	if err != nil {
