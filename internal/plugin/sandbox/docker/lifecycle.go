@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	pluginruntime "github.com/Tencent/WeKnora/internal/plugin/runtime"
 	"github.com/Tencent/WeKnora/internal/plugin/sandbox/docker/network"
 	"github.com/Tencent/WeKnora/internal/plugin/sandbox/docker/paths"
@@ -178,6 +179,10 @@ func (b *Backend) List(ctx context.Context, metadata map[string]string) ([]plugi
 }
 
 func (b *Backend) Inspect(ctx context.Context, id string) (pluginruntime.BackendInstanceState, error) {
+	return b.inspect(ctx, id, true)
+}
+
+func (b *Backend) inspect(ctx context.Context, id string, diagnosticsCache bool) (pluginruntime.BackendInstanceState, error) {
 	if !validContainerID(id) {
 		return pluginruntime.BackendInstanceState{}, errors.New("invalid container ID")
 	}
@@ -186,13 +191,16 @@ func (b *Backend) Inspect(ctx context.Context, id string) (pluginruntime.Backend
 		b.mu.Lock()
 		cached, ok := b.final[id]
 		b.mu.Unlock()
-		if ok {
+		if ok && diagnosticsCache {
 			cached.Instance.Metadata = maps.Clone(cached.Instance.Metadata)
 			return cached, nil
 		}
 		i, readErr := b.readRecord(id)
 		if readErr == nil {
 			return pluginruntime.BackendInstanceState{Instance: i}, nil
+		}
+		if !errors.Is(readErr, os.ErrNotExist) {
+			return pluginruntime.BackendInstanceState{}, fmt.Errorf("read cleanup locator: %w", readErr)
 		}
 		return pluginruntime.BackendInstanceState{}, err
 	}
@@ -244,7 +252,9 @@ func (b *Backend) stop(ctx context.Context, id string, grace time.Duration) erro
 	if !validContainerID(id) {
 		return errors.New("invalid container ID")
 	}
-	state, err := b.Inspect(ctx, id)
+	// A cached exit is diagnostic only, never cleanup authority: the same
+	// data source/generation path may now belong to a replacement container.
+	state, err := b.inspect(ctx, id, false)
 	if errdefs.IsNotFound(err) {
 		return nil
 	}
@@ -278,6 +288,8 @@ func (b *Backend) stop(ctx context.Context, id string, grace time.Duration) erro
 	b.mu.Lock()
 	svc := b.services[id]
 	b.mu.Unlock()
+	var policy *network.PinnedPolicy
+	var auditErr error
 	if svc != nil {
 		svc.cancel()
 		select {
@@ -285,20 +297,29 @@ func (b *Backend) stop(ctx context.Context, id string, grace time.Duration) erro
 		case <-ctx.Done():
 			return fmt.Errorf("audit consumer drain: %w", ctx.Err())
 		}
-		if err := svc.policy.Detach(); err != nil {
+		policy, auditErr = svc.policy, svc.auditErr
+	} else if _, err := os.Stat(b.pinRoot(id)); err == nil {
+		// A replacement Backend must not silently discard audit events left
+		// in pinned maps while the previous Controller was down.
+		policy, auditErr = network.OpenPinned(b.pinRoot(id))
+	}
+	if policy != nil {
+		auditErr = errors.Join(auditErr, b.drainAudit(ctx, i, policy))
+		if err := policy.Detach(); err != nil {
 			if retryErr := network.RemovePins(b.pinRoot(id)); retryErr != nil {
 				return errors.Join(err, retryErr)
 			}
 		}
-		b.mu.Lock()
-		if svc.auditErr != nil {
-			state.DiagnosticTail = TrimDiagnostics([]byte(state.DiagnosticTail + "\naudit failure/gap: " + svc.auditErr.Error()))
-		}
-		delete(b.services, id)
-		b.mu.Unlock()
 	} else if err := network.RemovePins(b.pinRoot(id)); err != nil {
 		return err
 	}
+	if auditErr != nil {
+		state.DiagnosticTail = TrimDiagnostics([]byte(state.DiagnosticTail + "\naudit failure/gap: " + auditErr.Error()))
+		logger.GetLogger(ctx).WithField("sandbox_id", id).WithError(auditErr).Error("plugin audit gap during exit/recovery cleanup")
+	}
+	b.mu.Lock()
+	delete(b.services, id)
+	b.mu.Unlock()
 	if err := b.unmountRuntime(filepath.Dir(i.UDSHostPath)); err != nil {
 		return err
 	}
@@ -328,6 +349,26 @@ func (b *Backend) stop(ctx context.Context, id string, grace time.Duration) erro
 		return err
 	}
 	return nil
+}
+
+// Called after process exit and consumer drain: no producer can refill this
+// bounded ring, and delivery errors remain visible in the exit diagnostics.
+func (b *Backend) drainAudit(ctx context.Context, i pluginruntime.BackendInstance, policy *network.PinnedPolicy) error {
+	generation, _ := strconv.ParseUint(i.Metadata["generation"], 10, 64)
+	identity := network.Identity{DeploymentID: b.config.DeploymentID, PluginID: i.Metadata["plugin_id"], DataSourceID: i.Metadata["data_source_id"], Generation: generation}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		event, err := policy.ReadPending(identity)
+		if err != nil || event == nil {
+			return err
+		}
+		if err := b.config.Audit(ctx, *event); err != nil {
+			return err
+		}
+		logger.GetLogger(ctx).WithField("plugin_audit", *event).Info("plugin network denied (exit/recovery drain)")
+	}
 }
 
 // Close does not abandon live workloads or audit consumers. Crashed processes

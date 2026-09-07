@@ -416,6 +416,24 @@ func (p *PinnedPolicy) Dropped() (uint64, error) {
 	return value, err
 }
 
+// ReadPending is used only after producers and the consumer have exited.
+// A nonblocking read uses the existing v0.11 reader API; nil means drained.
+func (p *PinnedPolicy) ReadPending(identity Identity) (*AuditEvent, error) {
+	if lost, err := p.Dropped(); err != nil || lost != 0 {
+		return nil, fmt.Errorf("audit gap: dropped=%d: %v", lost, err)
+	}
+	p.reader.SetDeadline(time.Now())
+	record, err := p.reader.Read()
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	event, err := decodeAuditEvent(record.RawSample, identity)
+	return &event, err
+}
+
 // RemovePins also handles an incomplete attachment after a controller crash.
 // The caller MUST first prove that the associated plugin process has exited.
 func RemovePins(root string) error {

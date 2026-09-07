@@ -114,12 +114,12 @@ func (r *Resolver) Acquire(dataSourceID string) (*Lease, error) {
 // Unpublish is generation-conditional so a stale stop cannot remove the new
 // generation. Once it returns, subsequent Resolve calls cannot acquire it.
 func (r *Resolver) Unpublish(dataSourceID string, generation uint64) error {
-	_, err := r.unpublish(dataSourceID, generation)
+	_, err := r.unpublish(dataSourceID, generation, "")
 	return err
 }
 
 func (r *Resolver) UnpublishAndDrain(ctx context.Context, dataSourceID string, generation uint64) error {
-	drained, err := r.unpublish(dataSourceID, generation)
+	drained, err := r.unpublish(dataSourceID, generation, "")
 	if err != nil || drained == nil {
 		return err
 	}
@@ -131,11 +131,24 @@ func (r *Resolver) UnpublishAndDrain(ctx context.Context, dataSourceID string, g
 	}
 }
 
-func (r *Resolver) unpublish(dataSourceID string, generation uint64) (<-chan struct{}, error) {
+// UnpublishInstance removes only this exact incarnation. Recovery may restart
+// the same generation; a delayed Stop of its predecessor must be harmless.
+// The returned channel closes once previously acquired leases are released.
+func (r *Resolver) UnpublishInstance(dataSourceID string, generation uint64, instanceID string) (<-chan struct{}, error) {
+	if instanceID == "" {
+		return nil, errors.New("instance ID is required")
+	}
+	return r.unpublish(dataSourceID, generation, instanceID)
+}
+
+func (r *Resolver) unpublish(dataSourceID string, generation uint64, instanceID string) (<-chan struct{}, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current, exists := r.handles[dataSourceID]
 	if !exists {
+		return nil, nil
+	}
+	if instanceID != "" && current.resolved.Handle.InstanceID() != instanceID {
 		return nil, nil
 	}
 	if generation < current.resolved.Generation {

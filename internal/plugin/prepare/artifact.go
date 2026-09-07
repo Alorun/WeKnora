@@ -3,6 +3,7 @@
 package prepare
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -179,6 +180,17 @@ func (d Discovery) Load(source string) (Package, error) {
 	info, err := os.Stat(target)
 	if err != nil {
 		return result, err
+	}
+	// The parsed manifest must be the one in the hashed snapshot, including
+	// when another administrator changed the source during discovery.
+	f, err = os.Open(filepath.Join(target, "plugin.yaml"))
+	if err != nil {
+		return result, err
+	}
+	frozenManifest, err := io.ReadAll(io.LimitReader(f, MaxManifestBytes+1))
+	_ = f.Close()
+	if err != nil || !bytes.Equal(data, frozenManifest) {
+		return result, errors.New("manifest changed during snapshot")
 	}
 	st := info.Sys().(*syscall.Stat_t)
 	host, err := d.Snapshots.HostPath(target)

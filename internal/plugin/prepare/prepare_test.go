@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/plugin/control"
@@ -60,7 +61,7 @@ func TestDiscoverySnapshotAndReplacement(t *testing.T) {
 }
 
 func TestDiscoveryRejectsUnsafePackages(t *testing.T) {
-	for _, kind := range []string{"entry_escape", "version", "permission", "link", "directory_link", "too_many", "duplicate", "modified_snapshot"} {
+	for _, kind := range []string{"entry_escape", "version", "permission", "link", "directory_link", "too_many", "duplicate", "modified_snapshot", "special_file", "oversized"} {
 		t.Run(kind, func(t *testing.T) {
 			d, source := fixture(t)
 			switch kind {
@@ -77,6 +78,10 @@ func TestDiscoveryRejectsUnsafePackages(t *testing.T) {
 				require.NoError(t, os.WriteFile(filepath.Join(source, "plugin.yaml"), []byte(strings.Replace(string(m), old, new, 1)), 0644))
 			case "link":
 				require.NoError(t, os.Symlink("plugin", filepath.Join(source, "link")))
+			case "special_file":
+				require.NoError(t, syscall.Mkfifo(filepath.Join(source, "fifo"), 0600))
+			case "oversized":
+				require.NoError(t, os.Truncate(filepath.Join(source, "plugin"), MaxArtifactBytes+1))
 			case "directory_link":
 				require.NoError(t, os.Symlink(source, filepath.Join(d.Packages.AppRoot, "linked")))
 			case "too_many":

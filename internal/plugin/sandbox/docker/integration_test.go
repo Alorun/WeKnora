@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -202,15 +203,32 @@ func TestDockerPluginRuntime(t *testing.T) {
 	require.NoError(t, b.Stop(ctx, h.InstanceID(), 0))
 	assertClean(t, b, spec, h.InstanceID())
 	for n := 0; n < 2; n++ {
-		s := integrationSpec(t, c)
+		// Recovery reuses the same generation and directory but has a new ID.
+		s := spec
+		s.StartupNonce = []byte(uuid.NewString())
 		handle, err := r.Start(ctx, s)
+		require.NoError(t, err)
+		require.NoError(t, b.Stop(ctx, h.InstanceID(), 0), "stale cleanup must not unmount the replacement")
+		require.NoError(t, r.Stop(ctx, h, 0), "stale runtime stop must not unpublish the replacement")
+		current, err := routes.Resolve(s.DataSourceID)
+		require.NoError(t, err)
+		require.Equal(t, handle.InstanceID(), current.Handle.InstanceID())
+		_, err = syncProbe(ctx, handle, "")
 		require.NoError(t, err)
 		require.NoError(t, r.Stop(ctx, handle, time.Second))
 		assertClean(t, b, s, handle.InstanceID())
+		h = handle
 	}
 	list, err := b.List(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, list)
+	// A damaged cleanup locator must remain visible, even after Docker removal.
+	recordPath := filepath.Join(b.recordsRoot(), h.InstanceID()+".json")
+	require.NoError(t, os.WriteFile(recordPath, []byte("incomplete"), 0600))
+	require.ErrorContains(t, b.Stop(ctx, h.InstanceID(), 0), "cleanup locator")
+	require.FileExists(t, recordPath)
+	require.NoError(t, os.Remove(recordPath)) // only this test's injected locator
+	require.NoError(t, b.Stop(ctx, h.InstanceID(), 0))
 }
 
 func counter(data []byte, key string) uint64 {
@@ -343,6 +361,12 @@ func TestDockerPluginFailures(t *testing.T) {
 
 func TestDockerPluginConcurrentLimitAndRecovery(t *testing.T) {
 	c := integrationConfig(t)
+	var recoveredAudits atomic.Int32
+	c.Audit = func(_ context.Context, e network.AuditEvent) error {
+		recoveredAudits.Add(1)
+		t.Logf("RECOVERED HOST AUDIT %+v", e)
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	b, err := New(ctx, c)
@@ -397,6 +421,7 @@ func TestDockerPluginConcurrentLimitAndRecovery(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, state.Running)
 		require.NoError(t, b2.Stop(ctx, i.ID, 0))
+		require.EqualValues(t, 4, recoveredAudits.Load(), "pending kernel audits must survive Controller replacement")
 		require.NoError(t, b2.Stop(ctx, i.ID, 0))
 		t.Logf("fresh Backend recovered/cleaned %s", i.ID)
 	}
@@ -418,6 +443,15 @@ func TestDockerPluginRecoveryChild(t *testing.T) {
 	require.NoError(t, err)
 	r := pr.New(b, pluginds.NewResolver())
 	h, err := r.Start(ctx, integrationSpec(t, c))
+	require.NoError(t, err)
+	// Simulate the crash window after the audit consumer has stopped but a
+	// final in-flight Sync still issues network attempts. Links/maps stay real.
+	b.mu.Lock()
+	svc := b.services[h.InstanceID()]
+	b.mu.Unlock()
+	svc.cancel()
+	<-svc.done
+	_, err = syncProbe(ctx, h, "network")
 	require.NoError(t, err)
 	t.Logf("leaving recoverable instance %s", h.InstanceID()) /* deliberately no Close: process exit */
 }

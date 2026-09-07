@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	plugindatasource "github.com/Tencent/WeKnora/internal/plugin/datasource"
@@ -188,12 +189,31 @@ func (r *PluginSandboxRuntime) Start(ctx context.Context, spec InstanceSpec) (Ru
 	if err := waitForSocket(ctx, instance.UDSHostPath, r.readyTimeout); err != nil {
 		return nil, cleanup(err, nil)
 	}
+	socketIdentity, err := os.Lstat(instance.UDSHostPath)
+	if err != nil || socketIdentity.Mode()&os.ModeSocket == 0 {
+		return nil, cleanup(fmt.Errorf("plugin UDS is not a socket: %v", err), nil)
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, r.dialTimeout)
 	defer cancel()
+	var connected atomic.Bool
 	conn, err := grpc.NewClient("passthrough:///plugin", grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(pluginsdk.MaxMessageBytes), grpc.MaxCallSendMsgSize(pluginsdk.MaxMessageBytes)),
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", instance.UDSHostPath)
+			// A broken local UDS requires a fresh Runtime Handshake. Inode
+			// numbers can be reused, so never reconnect an old Handle, even
+			// when the path and inode appear unchanged after replacement.
+			if connected.Load() {
+				return nil, errors.New("plugin UDS disconnected; new runtime handshake required")
+			}
+			conn, err := (&net.Dialer{}).DialContext(ctx, "unix", instance.UDSHostPath)
+			if err != nil {
+				return nil, err
+			}
+			if !connected.CompareAndSwap(false, true) {
+				conn.Close()
+				return nil, errors.New("plugin UDS handle is already connected")
+			}
+			return conn, nil
 		}))
 	if err != nil {
 		return nil, cleanup(fmt.Errorf("create plugin UDS client: %w", err), nil)
@@ -272,11 +292,15 @@ func (r *PluginSandboxRuntime) Stop(ctx context.Context, runtimeHandle RuntimeHa
 	grace = min(maxDuration(grace, 0), 10*time.Second)
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cleanupCancel()
-	if grace == 0 {
-		result = errors.Join(result, r.resolver.Unpublish(runtimeHandle.DataSourceID(), runtimeHandle.Generation()))
-	} else {
+	drained, unpublishErr := r.resolver.UnpublishInstance(runtimeHandle.DataSourceID(), runtimeHandle.Generation(), runtimeHandle.InstanceID())
+	result = errors.Join(result, unpublishErr)
+	if grace > 0 && drained != nil {
 		drainCtx, drainCancel := context.WithTimeout(cleanupCtx, grace)
-		result = errors.Join(result, r.resolver.UnpublishAndDrain(drainCtx, runtimeHandle.DataSourceID(), runtimeHandle.Generation()))
+		select {
+		case <-drained:
+		case <-drainCtx.Done():
+			result = errors.Join(result, drainCtx.Err())
+		}
 		drainCancel()
 	}
 	if !isConcrete || !concrete.shutdownAttempted {

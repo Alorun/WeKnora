@@ -117,6 +117,9 @@ func (b Builder) BuildInstanceSpec(ctx context.Context, installation control.Plu
 	if err != nil {
 		return spec, err
 	}
+	if g == nil {
+		return spec, errors.New("active directory grant is missing")
+	}
 	grant, err := b.Grants.Resolve(*g, *ds)
 	if err != nil {
 		return spec, err

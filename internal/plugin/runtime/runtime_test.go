@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	pluginv1 "github.com/Tencent/WeKnora/pkg/plugin/proto/v1"
 	pluginsdk "github.com/Tencent/WeKnora/pkg/plugin/sdk"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 type runtimeDataSource struct {
@@ -36,7 +38,7 @@ func (b *fakeBackend) StartService(ctx context.Context, spec InstanceSpec) (Back
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.started++
-	id := "instance-" + spec.DataSourceID
+	id := fmt.Sprintf("instance-%s-%d", spec.DataSourceID, b.started)
 	socket := filepath.Join(b.root, spec.DataSourceID, "plugin.sock")
 	control, err := pluginsdk.NewControlServer(pluginsdk.Identity{
 		PluginID: spec.PluginID, PluginVersion: spec.PluginVersion, ExtensionID: spec.ExtensionID,
@@ -125,6 +127,34 @@ func TestRuntimeFailureCleansBackendWithoutPublishing(t *testing.T) {
 	require.ErrorIs(t, resolveErr, plugindatasource.ErrHandleNotFound)
 	require.Equal(t, 1, backend.started)
 	require.Equal(t, 1, backend.stopped)
+}
+
+func TestRuntimeOldConnectionCannotReconnectToReplacement(t *testing.T) {
+	ctx := context.Background()
+	resolver := plugindatasource.NewResolver()
+	backend := &fakeBackend{root: t.TempDir(), healthStatus: pluginv1.HealthStatus_HEALTH_STATUS_READY}
+	r := New(backend, resolver)
+	spec := runtimeSpec(backend.root)
+	old, err := r.Start(ctx, spec)
+	require.NoError(t, err)
+	defer r.Stop(ctx, old, 0)
+	// The container can exit before Runtime.Stop closes its connection.
+	require.NoError(t, backend.Stop(ctx, old.InstanceID(), 0))
+	_, err = resolver.UnpublishInstance(spec.DataSourceID, spec.Generation, old.InstanceID())
+	require.NoError(t, err)
+	replacement, err := r.Start(ctx, spec)
+	require.NoError(t, err)
+	defer r.Stop(ctx, replacement, 0)
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, err = old.ControlClient().Health(callCtx, &pluginv1.HealthRequest{}, grpc.WaitForReady(true))
+	require.Error(t, err, "old UDS client must not reconnect to a new incarnation")
+	_ = r.Stop(ctx, old, 0)
+	current, err := resolver.Resolve(spec.DataSourceID)
+	require.NoError(t, err)
+	require.Equal(t, replacement.InstanceID(), current.Handle.InstanceID())
+	_, err = r.Health(ctx, replacement)
+	require.NoError(t, err)
 }
 
 func TestHandshakeRejectsIdentityVersionAndNonceMismatch(t *testing.T) {

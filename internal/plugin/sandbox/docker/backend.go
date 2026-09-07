@@ -265,8 +265,11 @@ func (b *Backend) consume(ctx context.Context, i pluginruntime.BackendInstance, 
 	generation, _ := strconv.ParseUint(i.Metadata["generation"], 10, 64)
 	identity := network.Identity{DeploymentID: b.config.DeploymentID, PluginID: i.Metadata["plugin_id"], DataSourceID: i.Metadata["data_source_id"], Generation: generation}
 	for {
-		events, err := svc.policy.ReadEvents(ctx, 1, identity)
 		if ctx.Err() != nil {
+			return
+		}
+		events, err := svc.policy.ReadEvents(ctx, 1, identity)
+		if err != nil && ctx.Err() != nil {
 			return
 		}
 		if err == nil {
