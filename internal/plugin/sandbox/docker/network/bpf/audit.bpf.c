@@ -26,6 +26,14 @@ struct {
     __uint(max_entries, 1 << 20);
 } audit_events SEC(".maps");
 
+// Loss is observable even if a plugin deliberately floods the bounded ring.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} audit_dropped SEC(".maps");
+
 enum audit_hook {
     HOOK_CONNECT4 = 1,
     HOOK_CONNECT6 = 2,
@@ -54,7 +62,11 @@ static __always_inline int deny_and_audit(struct bpf_sock_addr *ctx, __u8 family
         __builtin_memcpy(event.destination_address, ctx->user_ip6, sizeof(ctx->user_ip6));
     }
 
-    bpf_ringbuf_output(&audit_events, &event, sizeof(event), 0);
+    if (bpf_ringbuf_output(&audit_events, &event, sizeof(event), 0) < 0) {
+        __u32 key = 0;
+        __u64 *dropped = bpf_map_lookup_elem(&audit_dropped, &key);
+        if (dropped) __sync_fetch_and_add(dropped, 1);
+    }
     return 0;
 }
 

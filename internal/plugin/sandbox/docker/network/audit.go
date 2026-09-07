@@ -1,4 +1,5 @@
-// Package network contains the fixed cgroup eBPF deny-and-audit prototype.
+// Package network contains the fixed cgroup deny policy shared by the formal
+// backend and the original verification entrypoint. No tenant rules are accepted.
 package network
 
 import (
@@ -42,6 +43,7 @@ var (
 
 // Identity is Host-owned metadata associated with a cgroup ID.
 type Identity struct {
+	DeploymentID string `json:"deployment_id,omitempty"`
 	RunID        string `json:"prototype_run_id"`
 	PluginID     string `json:"plugin_id"`
 	DataSourceID string `json:"data_source_id"`
@@ -50,6 +52,7 @@ type Identity struct {
 
 // AuditEvent is the bounded userspace representation of one denied socket operation.
 type AuditEvent struct {
+	Denied          bool      `json:"denied"`
 	CgroupID        uint64    `json:"cgroup_id"`
 	PID             uint32    `json:"pid"`
 	UID             uint32    `json:"uid"`
@@ -82,6 +85,7 @@ type PinnedPolicy struct {
 	pinRoot    string
 	links      []link.Link
 	eventsMap  *ebpf.Map
+	droppedMap *ebpf.Map
 	reader     *ringbuf.Reader
 	collection *ebpf.Collection
 }
@@ -92,9 +96,17 @@ func AttachAndPin(cgroupPath, pinRoot string) (_ *PinnedPolicy, err error) {
 	if err := validatePinRoot(pinRoot); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(pinRoot, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(pinRoot), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(pinRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create BPF pin root: %w", err)
 	}
+	defer func() {
+		if err != nil {
+			_ = os.Remove(pinRoot)
+		}
+	}()
 
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(auditObject))
 	if err != nil {
@@ -112,6 +124,13 @@ func AttachAndPin(cgroupPath, pinRoot string) (_ *PinnedPolicy, err error) {
 	}()
 
 	policy.eventsMap = collection.Maps["audit_events"]
+	policy.droppedMap = collection.Maps["audit_dropped"]
+	if policy.droppedMap == nil {
+		return nil, errors.New("missing audit loss counter")
+	}
+	if err = policy.droppedMap.Pin(filepath.Join(pinRoot, "dropped")); err != nil {
+		return nil, err
+	}
 	if policy.eventsMap == nil {
 		return nil, errors.New("BPF object is missing audit_events map")
 	}
@@ -159,6 +178,10 @@ func OpenPinned(pinRoot string) (_ *PinnedPolicy, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("open pinned audit map: %w", err)
 	}
+	policy.droppedMap, err = ebpf.LoadPinnedMap(filepath.Join(pinRoot, "dropped"), nil)
+	if err != nil {
+		return nil, err
+	}
 	for _, item := range programs {
 		pinned, openErr := link.LoadPinnedLink(filepath.Join(pinRoot, item.name), nil)
 		if openErr != nil {
@@ -183,6 +206,9 @@ func (p *PinnedPolicy) ReadEvents(ctx context.Context, count int, identity Ident
 	}
 	events := make([]AuditEvent, 0, count)
 	for len(events) < count {
+		if lost, err := p.Dropped(); err != nil || lost != 0 {
+			return nil, fmt.Errorf("audit gap: dropped=%d: %v", lost, err)
+		}
 		deadline := time.Now().Add(200 * time.Millisecond)
 		if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 			deadline = contextDeadline
@@ -222,6 +248,10 @@ func (p *PinnedPolicy) CloseHandlesKeepPins() error {
 		errs = appendError(errs, item.Close())
 	}
 	p.links = nil
+	if p.collection == nil && p.droppedMap != nil {
+		errs = appendError(errs, p.droppedMap.Close())
+	}
+	p.droppedMap = nil
 	if p.collection != nil {
 		p.collection.Close()
 		p.collection = nil
@@ -250,6 +280,15 @@ func (p *PinnedPolicy) Detach() error {
 		errs = appendError(errs, item.Close())
 	}
 	p.links = nil
+	if p.droppedMap != nil {
+		if err := p.droppedMap.Unpin(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+		if p.collection == nil {
+			errs = appendError(errs, p.droppedMap.Close())
+		}
+		p.droppedMap = nil
+	}
 	if p.eventsMap != nil {
 		if err := p.eventsMap.Unpin(); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
@@ -360,11 +399,43 @@ func decodeAuditEvent(sample []byte, identity Identity) (AuditEvent, error) {
 	}
 	hooks := map[uint8]string{1: "connect4", 2: "connect6", 3: "sendmsg4", 4: "sendmsg6"}
 	return AuditEvent{
+		Denied:   true,
 		CgroupID: raw.CgroupID, PID: raw.PID, UID: raw.UID,
 		Family: family, Protocol: protocol, Hook: hooks[raw.Hook],
 		DestinationIP: address.String(), DestinationPort: raw.DestinationPort,
 		KernelTimeNS: raw.KernelTimeNS, ObservedAt: time.Now().UTC(), Identity: identity,
 	}, nil
+}
+
+func (p *PinnedPolicy) Dropped() (uint64, error) {
+	if p.droppedMap == nil {
+		return 0, errors.New("audit loss counter unavailable")
+	}
+	var value uint64
+	err := p.droppedMap.Lookup(uint32(0), &value)
+	return value, err
+}
+
+// RemovePins also handles an incomplete attachment after a controller crash.
+// The caller MUST first prove that the associated plugin process has exited.
+func RemovePins(root string) error {
+	if err := validatePinRoot(root); err != nil {
+		return err
+	}
+	var result error
+	names := []string{eventsPinName, "dropped"}
+	for _, p := range programs {
+		names = append(names, p.name)
+	}
+	for _, name := range names {
+		if err := os.Remove(filepath.Join(root, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			result = errors.Join(result, err)
+		}
+	}
+	if err := os.Remove(root); err != nil && !errors.Is(err, os.ErrNotExist) {
+		result = errors.Join(result, err)
+	}
+	return result
 }
 
 func validatePinRoot(path string) error {

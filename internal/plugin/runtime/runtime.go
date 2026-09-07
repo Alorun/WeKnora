@@ -1,6 +1,5 @@
 // Package runtime implements the formal external plugin runtime contract. The
-// Docker backend is intentionally absent in Phase B; callers must inject a
-// backend, and production without one remains runtime_not_available.
+// backend is injected explicitly; production without one remains unavailable.
 package runtime
 
 import (
@@ -25,11 +24,19 @@ var ErrRuntimeNotAvailable = errors.New(pluginsdk.ErrorRuntimeNotAvailable)
 type ArtifactReference struct {
 	Digest    string
 	EntryPath string
+	AppPath   string
+	HostPath  string
+	Device    uint64
+	Inode     uint64
 }
 
 type DirectoryGrantReference struct {
 	ID         string
 	Generation uint64
+	AppPath    string
+	HostPath   string
+	Device     uint64
+	Inode      uint64
 }
 
 type EffectivePermissions struct {
@@ -57,6 +64,7 @@ type InstanceSpec struct {
 	Artifact             ArtifactReference
 	Grant                *DirectoryGrantReference
 	RuntimeHostPath      string
+	RuntimeAppPath       string
 	Permissions          EffectivePermissions
 	Resources            ResourceLimits
 }
@@ -87,10 +95,11 @@ type BackendInstance struct {
 }
 
 type BackendInstanceState struct {
-	Instance  BackendInstance
-	Running   bool
-	ExitCode  int
-	OOMKilled bool
+	Instance       BackendInstance
+	Running        bool
+	ExitCode       int
+	OOMKilled      bool
+	DiagnosticTail string
 }
 
 type PluginSandboxBackend interface {
@@ -132,13 +141,15 @@ func New(backend PluginSandboxBackend, resolver *plugindatasource.Resolver) *Plu
 }
 
 type handle struct {
-	instance   BackendInstance
-	dsID       string
-	generation uint64
-	conn       *grpc.ClientConn
-	control    pluginv1.PluginControlClient
-	datasource pluginv1.DataSourcePluginClient
-	closeOnce  sync.Once
+	instance          BackendInstance
+	dsID              string
+	generation        uint64
+	conn              *grpc.ClientConn
+	control           pluginv1.PluginControlClient
+	datasource        pluginv1.DataSourcePluginClient
+	closeOnce         sync.Once
+	stopMu            sync.Mutex
+	shutdownAttempted bool
 }
 
 func (h *handle) InstanceID() string                                { return h.instance.ID }
@@ -163,10 +174,12 @@ func (r *PluginSandboxRuntime) Start(ctx context.Context, spec InstanceSpec) (Ru
 		return nil, fmt.Errorf("start plugin service: %w", err)
 	}
 	cleanup := func(startErr error, conn *grpc.ClientConn) error {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
 		if conn != nil {
 			startErr = errors.Join(startErr, conn.Close())
 		}
-		startErr = errors.Join(startErr, r.backend.Stop(context.WithoutCancel(ctx), instance.ID, 0))
+		startErr = errors.Join(startErr, r.backend.Stop(cleanupCtx, instance.ID, 0))
 		return startErr
 	}
 	if instance.ID == "" || instance.UDSHostPath == "" {
@@ -218,6 +231,9 @@ func (r *PluginSandboxRuntime) Start(ctx context.Context, spec InstanceSpec) (Ru
 	result := &handle{instance: instance, dsID: spec.DataSourceID, generation: spec.Generation, conn: conn,
 		control: controlClient, datasource: pluginv1.NewDataSourcePluginClient(conn)}
 	// Publication is deliberately last: every validation above has completed.
+	if err := ctx.Err(); err != nil {
+		return nil, cleanup(err, conn)
+	}
 	if err := r.resolver.Publish(spec.DataSourceID, spec.Generation, result); err != nil {
 		return nil, cleanup(fmt.Errorf("publish plugin handle: %w", err), conn)
 	}
@@ -247,15 +263,32 @@ func (r *PluginSandboxRuntime) Stop(ctx context.Context, runtimeHandle RuntimeHa
 	if runtimeHandle == nil {
 		return nil
 	}
-	var result error
-	if err := r.resolver.UnpublishAndDrain(ctx, runtimeHandle.DataSourceID(), runtimeHandle.Generation()); err != nil {
-		result = errors.Join(result, err)
+	concrete, isConcrete := runtimeHandle.(*handle)
+	if isConcrete {
+		concrete.stopMu.Lock()
+		defer concrete.stopMu.Unlock()
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), maxDuration(grace, time.Second))
-	_, shutdownErr := runtimeHandle.ControlClient().Shutdown(shutdownCtx, &pluginv1.ShutdownRequest{GraceMillis: grace.Milliseconds()})
-	cancel()
-	result = errors.Join(result, shutdownErr)
-	result = errors.Join(result, r.backend.Stop(context.WithoutCancel(ctx), runtimeHandle.InstanceID(), grace))
+	var result error
+	grace = min(maxDuration(grace, 0), 10*time.Second)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cleanupCancel()
+	if grace == 0 {
+		result = errors.Join(result, r.resolver.Unpublish(runtimeHandle.DataSourceID(), runtimeHandle.Generation()))
+	} else {
+		drainCtx, drainCancel := context.WithTimeout(cleanupCtx, grace)
+		result = errors.Join(result, r.resolver.UnpublishAndDrain(drainCtx, runtimeHandle.DataSourceID(), runtimeHandle.Generation()))
+		drainCancel()
+	}
+	if !isConcrete || !concrete.shutdownAttempted {
+		shutdownCtx, cancel := context.WithTimeout(cleanupCtx, maxDuration(grace, time.Second))
+		_, shutdownErr := runtimeHandle.ControlClient().Shutdown(shutdownCtx, &pluginv1.ShutdownRequest{GraceMillis: grace.Milliseconds()})
+		cancel()
+		result = errors.Join(result, shutdownErr)
+		if isConcrete {
+			concrete.shutdownAttempted = true
+		}
+	}
+	result = errors.Join(result, r.backend.Stop(cleanupCtx, runtimeHandle.InstanceID(), grace))
 	if concrete, ok := runtimeHandle.(*handle); ok {
 		concrete.closeOnce.Do(func() { result = errors.Join(result, concrete.conn.Close()) })
 	}

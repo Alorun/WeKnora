@@ -109,6 +109,10 @@ func TestRuntimePublishesOnlyAfterReadyAndDrainsOnStop(t *testing.T) {
 	_, err = resolver.Resolve("ds-1")
 	require.ErrorIs(t, err, plugindatasource.ErrHandleNotFound)
 	require.Equal(t, 1, backend.stopped)
+	// Repeating Stop must not call an already-closed gRPC connection, while
+	// still retrying idempotent backend cleanup.
+	require.NoError(t, runtime.Stop(context.Background(), handle, 0))
+	require.Equal(t, 2, backend.stopped)
 }
 
 func TestRuntimeFailureCleansBackendWithoutPublishing(t *testing.T) {
