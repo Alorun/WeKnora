@@ -4,6 +4,16 @@ set -euo pipefail
 # Only this test's directory receives mount propagation. SYS_ADMIN is needed
 # for per-instance tmpfs mounts, not for BPF; no host-global policy is changed.
 repo_root=$(git rev-parse --show-toplevel)
+mode=${1:-backend}
+case "$mode" in
+  backend) ;;
+  local-directory)
+    : "${C2_ARTIFACT:?set C2_ARTIFACT to the independently built unpacked plugin directory}"
+    test -f "$C2_ARTIFACT/plugin.yaml"
+    C2_ARTIFACT=$(cd "$C2_ARTIFACT" && pwd)
+    ;;
+  *) echo "usage: $0 [backend|local-directory]" >&2; exit 1 ;;
+esac
 test_root=$(mktemp -d /tmp/wkc1-XXXXXXXX)
 run_id="c1-$(date +%s)-$$"
 image="weknora/plugin-c1-test:$run_id"
@@ -46,19 +56,31 @@ run_controller() {
     --mount "type=bind,src=$docker_log_root,dst=/docker-logs,readonly" \
     --env "C1_HOST_ROOT=$test_root" --env C1_APP_ROOT=/wk --env "C1_DEPLOYMENT=$run_id" \
     --env "C1_IMAGE=$image" --env "C1_ADMIN_UID=$(id -u)" \
-    --env "C1_OPERATION=$suffix" \
+    --env "C1_OPERATION=$suffix" --env "C2_ARTIFACT=${controller_artifact:-}" \
     "$image" /wk/backend.test "$@"
 }
 trap cleanup EXIT
 cd "$repo_root"
 chmod 755 "$test_root"
 CGO_ENABLED=0 go build -trimpath -o "$test_root/gate" ./cmd/weknora-plugin-gate
-CGO_ENABLED=0 go build -trimpath -o "$test_root/probe" ./internal/plugin/sandbox/docker/testdata/runtime-probe
+test_tags=integration,netgo,osusergo
+if test "$mode" = local-directory; then
+  mkdir "$test_root/packages"
+  cp -R -- "$C2_ARTIFACT" "$test_root/packages/local-directory"
+  controller_artifact=/wk/packages/local-directory
+  test_tags+=,localdirectory
+else
+  CGO_ENABLED=0 go build -trimpath -o "$test_root/probe" ./internal/plugin/sandbox/docker/testdata/runtime-probe
+fi
 # Existing Runtime imports utils/pg_query, whose parser requires CGO. Link the
 # controller test statically; the SDK probe and gate remain CGO-free.
 race_flags=()
 if test "${C1_RACE:-0}" = 1; then race_flags=(-race); fi
-CGO_ENABLED=1 go test "${race_flags[@]}" -tags=integration,netgo,osusergo -c -ldflags '-linkmode external -extldflags -static' -o "$test_root/backend.test" ./internal/plugin/sandbox/docker
+CGO_ENABLED=1 go test "${race_flags[@]}" -tags="$test_tags" -c -ldflags '-linkmode external -extldflags -static' -o "$test_root/backend.test" ./internal/plugin/sandbox/docker
 docker build -q -t "$image" -f internal/plugin/sandbox/docker/testdata/Dockerfile internal/plugin/sandbox/docker/testdata
-run_controller run -test.run '^TestDockerPlugin' -test.v -test.timeout 5m
-run_controller no-policy -test.run '^TestDockerPluginPolicyUnavailable$' -test.v -test.timeout 1m
+if test "$mode" = local-directory; then
+  run_controller run -test.run '^TestLocalDirectoryRuntime$' -test.v -test.timeout 3m
+else
+  run_controller run -test.run '^TestDockerPlugin' -test.v -test.timeout 5m
+  run_controller no-policy -test.run '^TestDockerPluginPolicyUnavailable$' -test.v -test.timeout 1m
+fi
