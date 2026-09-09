@@ -12,6 +12,7 @@ import (
 	"net/textproto"
 	"sync"
 
+	"github.com/Tencent/WeKnora/internal/application/access"
 	core "github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/plugin/control"
 	pluginstore "github.com/Tencent/WeKnora/internal/plugin/store"
@@ -38,6 +39,7 @@ type RevisionProcessor struct {
 	enqueuer    interfaces.TaskEnqueuer
 	maxContent  int
 	loadTenant  func(context.Context, uint64) (*types.Tenant, error)
+	loadKB      func(context.Context, string) (*types.KnowledgeBase, error)
 }
 
 func NewRevisionProcessor(store RevisionStore, knowledge interfaces.KnowledgeService, enqueuer interfaces.TaskEnqueuer) *RevisionProcessor {
@@ -48,6 +50,12 @@ func NewRevisionProcessor(store RevisionStore, knowledge interfaces.KnowledgeSer
 // reconstruct the same trusted tenant context as the existing deletion worker.
 func (p *RevisionProcessor) SetTenantLoader(load func(context.Context, uint64) (*types.Tenant, error)) {
 	p.loadTenant = load
+}
+
+// SetKnowledgeBaseLoader supplies persisted KB ownership for trusted cleanup
+// tasks. It is wired once before workers start, alongside the tenant loader.
+func (p *RevisionProcessor) SetKnowledgeBaseLoader(load func(context.Context, string) (*types.KnowledgeBase, error)) {
+	p.loadKB = load
 }
 
 func (p *RevisionProcessor) AcceptExternalItem(
@@ -231,8 +239,26 @@ func (p *RevisionProcessor) enqueueRevision(ctx context.Context, knowledge *type
 }
 
 func (p *RevisionProcessor) cleanupKnowledge(ctx context.Context, tenantID uint64, knowledgeID string) error {
-	if p.loadTenant == nil {
-		return errors.New("revision cleanup tenant loader is not configured")
+	if p.loadTenant == nil || p.loadKB == nil {
+		return errors.New("revision cleanup tenant/knowledge base loaders are not configured")
+	}
+	knowledge, err := p.knowledge.GetRepository().GetKnowledgeByIDOnly(ctx, knowledgeID)
+	if err != nil {
+		return err
+	}
+	if knowledge == nil || knowledge.ID != knowledgeID || knowledge.TenantID != tenantID || knowledge.KnowledgeBaseID == "" {
+		return errors.New("revision cleanup knowledge binding mismatch")
+	}
+	kb, err := p.loadKB(ctx, knowledge.KnowledgeBaseID)
+	if err != nil {
+		return err
+	}
+	if kb == nil || kb.ID != knowledge.KnowledgeBaseID {
+		return errors.New("revision cleanup knowledge base mismatch")
+	}
+	ctx, err = access.WithKBTaskWrite(ctx, kb, tenantID)
+	if err != nil {
+		return err
 	}
 	tenant, err := p.loadTenant(ctx, tenantID)
 	if err != nil {
@@ -243,7 +269,6 @@ func (p *RevisionProcessor) cleanupKnowledge(ctx context.Context, tenantID uint6
 	}
 	// DeleteKnowledge adjusts this request-local storage counter.
 	localTenant := *tenant
-	ctx = context.WithValue(ctx, types.TenantIDContextKey, tenantID)
 	ctx = context.WithValue(ctx, types.TenantInfoContextKey, &localTenant)
 	if err := p.knowledge.DeleteKnowledge(ctx, knowledgeID); err != nil {
 		return err

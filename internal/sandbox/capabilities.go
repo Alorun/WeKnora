@@ -92,9 +92,10 @@ type SessionCapabilityProvider interface {
 }
 
 // SessionInstallShellExecutor runs install/maintenance shell commands, which
-// need root and the skills image root. It is a separate interface from
-// SessionShellExecutor so the privilege is something a caller must ask for by
-// name: ordinary chat sessions keep the non-root, /workspace-only contract.
+// need the skills image root. It is a separate interface from
+// SessionShellExecutor so reaching outside /workspace is something a caller
+// must ask for by name: ordinary chat sessions keep the /workspace-only
+// contract even though they already run as root.
 type SessionInstallShellExecutor interface {
 	ExecShellCommandWithOptions(
 		ctx context.Context,
@@ -123,6 +124,27 @@ type SessionDestroyer interface {
 // the current runtime cannot honour the capability.
 type SessionInstallCapabilityProvider interface {
 	SessionInstallShellExecutor() SessionInstallShellExecutor
+}
+
+// SessionTerminalManager opens interactive PTYs on the sandbox bound to a
+// session. Like the file store it is provider-neutral: the WebSocket
+// handler bridges browser terminal frames to it without knowing whether
+// E2B or Cube serves the session.
+type SessionTerminalManager interface {
+	// OpenSessionTerminal connects to the session's currently bound sandbox
+	// and opens a PTY. It is lookup-only: when no live sandbox is bound it
+	// returns ErrNoLiveSessionSandbox instead of provisioning one, because
+	// the terminal entry point lacks the agent's config-pin context and
+	// must not create microVMs as a side effect. A backend that cannot
+	// stream PTYs returns ErrTerminalUnsupported, not "no sandbox".
+	OpenSessionTerminal(ctx context.Context, sessionID string, opts RemoteTerminalOptions) (RemoteTerminalSession, error)
+}
+
+// SessionTerminalProvider is implemented by managers that MAY offer
+// interactive terminals. The accessor returns nil when the current runtime
+// cannot honour the capability.
+type SessionTerminalProvider interface {
+	SessionTerminalManager() SessionTerminalManager
 }
 
 // SessionTurnHolder marks the start and end of one chat turn on a session's

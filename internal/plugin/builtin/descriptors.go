@@ -69,6 +69,8 @@ func Descriptors(
 		{"zhipu", websearch.NewZhipuProvider},
 		{"exa", websearch.NewExaProvider},
 		{"metaso", websearch.NewMetasoProvider},
+		{"bocha", websearch.NewBochaProvider},
+		{"brave", websearch.NewBraveProvider},
 	}
 	for _, item := range webFactories {
 		result = append(result, descriptor(

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Tencent/WeKnora/internal/application/access"
 	"github.com/Tencent/WeKnora/internal/plugin/control"
 	pluginstore "github.com/Tencent/WeKnora/internal/plugin/store"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -85,6 +86,13 @@ func (s *revisionKnowledgeService) DeleteKnowledge(ctx context.Context, id strin
 	if !ok || tenant.ID != 7 || ctx.Value(types.TenantIDContextKey) != uint64(7) {
 		return errors.New("deletion requires trusted tenant context")
 	}
+	knowledge, err := s.repo.GetKnowledgeByIDOnly(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := access.RequireKBWrite(ctx, &types.KnowledgeBase{ID: knowledge.KnowledgeBaseID, TenantID: knowledge.TenantID}); err != nil {
+		return err
+	}
 	return s.repo.db.Delete(&types.Knowledge{}, "id = ?", id).Error
 }
 func (s *revisionKnowledgeService) BuildDocumentProcessTask(_ context.Context, knowledgeID string) (*asynq.Task, []asynq.Option, error) {
@@ -134,6 +142,9 @@ func revisionFixture(t *testing.T) (*gorm.DB, *pluginstore.Store, *RevisionProce
 	processor := NewRevisionProcessor(store, knowledge, queue)
 	processor.SetTenantLoader(func(_ context.Context, id uint64) (*types.Tenant, error) {
 		return &types.Tenant{ID: id}, nil
+	})
+	processor.SetKnowledgeBaseLoader(func(_ context.Context, id string) (*types.KnowledgeBase, error) {
+		return &types.KnowledgeBase{ID: id, TenantID: 7}, nil
 	})
 	return db, store, processor, queue
 }

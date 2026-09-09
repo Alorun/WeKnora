@@ -172,6 +172,8 @@ func (c *E2BRemoteClient) Capabilities() RemoteSandboxCapabilities {
 		// E2B has no named-volume mount API that WeKnora can use; advertising
 		// it would let a workspace configure a mount that never appears.
 		SupportsVolumes: false,
+		// envd exposes an interactive PTY service that go-e2b wraps.
+		SupportsTerminals: true,
 	}
 }
 
@@ -864,10 +866,12 @@ func (c *E2BRemoteClient) Exec(
 }
 
 // Filesystem operations name DefaultSandboxExecUser explicitly rather than
-// relying on the daemon's default account. It keeps ownership aligned with the
-// account scripts run as, and it is required for interoperability: E2B Cloud
-// falls back to "user" when the request omits it, while other E2B-compatible
-// control planes reject the call outright.
+// relying on the daemon's default account. Naming the user is required for
+// interoperability: E2B Cloud falls back to "user" when the request omits it,
+// while other E2B-compatible control planes reject the call outright. The
+// default account is root, which matches what scripts run as; under
+// one-session-one-sandbox there is no shared volume here to defend with
+// file-mode ownership.
 func (c *E2BRemoteClient) WriteFile(
 	ctx context.Context,
 	handle RemoteSandboxHandle,

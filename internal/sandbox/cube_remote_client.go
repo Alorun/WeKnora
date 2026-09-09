@@ -76,7 +76,10 @@ func NewCubeRemoteClientWithPool(
 		})
 	}
 	// Route both planes through the existing gateway pool while correcting
-	// the SDK's root-default filesystem identity.
+	// the SDK's root-default filesystem identity. The timeout lives in the
+	// transport rather than on http.Client so PTY streams, which ride
+	// /process.Process/ and hold the response body open for the life of the
+	// terminal, are not cut off at CubeHTTPTimeout.
 	routingConfig := *config
 	routingConfig.Type = SandboxTypeCube
 	httpClient := &http.Client{
@@ -148,6 +151,8 @@ func (c *CubeRemoteClient) Capabilities() RemoteSandboxCapabilities {
 		// CreateOptions still has no volume-mount field; skills ride on
 		// snapshots instead, so this stays false.
 		SupportsVolumes: false,
+		// envd exposes an interactive PTY service that the Cube SDK wraps.
+		SupportsTerminals: true,
 	}
 }
 
@@ -664,9 +669,11 @@ func (c *CubeRemoteClient) Exec(
 	logCubeDataPlaneExec(ctx, c, sb, request.User, line)
 
 	startedAt := time.Now()
-	// User comes from the neutral request rather than being hardcoded: running
-	// everything as root silently defeats file-mode protections on shared
-	// volumes, and made this adapter behave differently from E2B's.
+	// User comes from the neutral request rather than being hardcoded, so the
+	// account a Cube exec lands on matches the other backends. The default is
+	// now root (see DefaultSandboxExecUser); the shared-volume concern that
+	// once made root here a footgun no longer applies under
+	// one-session-one-sandbox.
 	sdkResult, execErr := sb.Commands().Run(execCtx, line, cubesandbox.CommandOptions{
 		Timeout: request.Timeout,
 		Envs:    envs,
