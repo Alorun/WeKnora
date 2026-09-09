@@ -205,7 +205,7 @@ func (a *GRPCConnectorAdapter) FetchStream(ctx context.Context, config *types.Da
 	callCtx, cancel := context.WithTimeout(ctx, a.syncTimeout)
 	defer cancel()
 	stream, err := rpc.DataSourceClient().Sync(callCtx, &pluginv1.SyncRequest{
-		ConfigJson: configJSON, CursorJson: cursorJSON, ForceFull: cursor == nil,
+		ConfigJson: configJSON, CursorJson: cursorJSON, ForceFull: cursor == nil || core.ExternalForceFull(ctx),
 		MultimodalEnabled: config != nil && config.MultimodalEnabled,
 	})
 	if err != nil {

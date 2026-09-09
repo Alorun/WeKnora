@@ -35,6 +35,18 @@ type DataSourceService struct {
 	tagService        interfaces.KnowledgeTagService
 	audit             interfaces.AuditLogService
 	externalIngestor  datasource.ExternalRevisionIngestor
+	externalLifecycle datasource.ExternalLifecycle
+}
+
+func (s *DataSourceService) SetExternalLifecycle(lifecycle datasource.ExternalLifecycle) {
+	s.externalLifecycle = lifecycle
+}
+
+func (s *DataSourceService) hasExternalBinding(ctx context.Context, id string) (bool, error) {
+	if s.connectorRegistry == nil {
+		return false, nil
+	}
+	return s.connectorRegistry.HasExternalBinding(ctx, id)
 }
 
 // SetExternalRevisionIngestor installs the Phase-B-only durable ingestion
@@ -175,6 +187,14 @@ func (s *DataSourceService) UpdateDataSource(ctx context.Context, ds *types.Data
 	if ds.TenantID != existing.TenantID {
 		return nil, datasource.ErrDataSourceInvalid
 	}
+	if external, err := s.hasExternalBinding(ctx, ds.ID); err != nil {
+		return nil, err
+	} else if external {
+		if s.externalLifecycle == nil {
+			return nil, fmt.Errorf("external lifecycle unavailable")
+		}
+		return s.externalLifecycle.UpdateDataSource(ctx, ds)
+	}
 
 	// Credentials NEVER flow through this endpoint — they live behind the
 	// /credentials subresource. Force-preserve the stored credentials map
@@ -246,6 +266,11 @@ func (s *DataSourceService) UpdateDataSource(ctx context.Context, ds *types.Data
 func (s *DataSourceService) UpdateDataSourceCredentials(
 	ctx context.Context, id string, credentials map[string]interface{},
 ) (*types.DataSource, error) {
+	if external, err := s.hasExternalBinding(ctx, id); err != nil {
+		return nil, err
+	} else if external {
+		return nil, fmt.Errorf("external plugin configuration is fixed; credentials are not provisioned")
+	}
 	if id == "" {
 		return nil, datasource.ErrDataSourceInvalid
 	}
@@ -287,6 +312,11 @@ func (s *DataSourceService) UpdateDataSourceCredentials(
 // ClearDataSourceCredentials wipes the connector credential map without
 // touching any other config field. Idempotent.
 func (s *DataSourceService) ClearDataSourceCredentials(ctx context.Context, id string) error {
+	if external, err := s.hasExternalBinding(ctx, id); err != nil {
+		return err
+	} else if external {
+		return fmt.Errorf("external plugin configuration is fixed")
+	}
 	if id == "" {
 		return datasource.ErrDataSourceInvalid
 	}
@@ -328,6 +358,16 @@ func (s *DataSourceService) ClearDataSourceCredentials(ctx context.Context, id s
 
 // DeleteDataSource deletes a data source (soft delete)
 func (s *DataSourceService) DeleteDataSource(ctx context.Context, id string) error {
+	if external, err := s.hasExternalBinding(ctx, id); err != nil {
+		return err
+	} else if external {
+		if s.externalLifecycle == nil {
+			return fmt.Errorf("external lifecycle unavailable")
+		}
+		if err := s.externalLifecycle.SetEnabled(ctx, id, false); err != nil {
+			return err
+		}
+	}
 	// Verify data source exists
 	existing, err := s.dsRepo.FindByID(ctx, id)
 	if err != nil {
@@ -360,6 +400,15 @@ func (s *DataSourceService) ValidateConnection(ctx context.Context, dsID string)
 	if err != nil {
 		return err
 	}
+	external, err := s.hasExternalBinding(ctx, dsID)
+	if err != nil {
+		return err
+	}
+	if external && s.externalLifecycle != nil {
+		if _, err := s.externalLifecycle.Generation(ctx, dsID); err != nil {
+			return err
+		}
+	}
 
 	// Get connector
 	connector, err := s.connectorRegistry.ResolveConnector(ctx, ds)
@@ -373,6 +422,11 @@ func (s *DataSourceService) ValidateConnection(ctx context.Context, dsID string)
 		return datasource.ErrInvalidConfig
 	}
 
+	// External validation never rewrites desired state (especially a concurrent
+	// administrator pause/revocation). Lifecycle owns those transitions.
+	if external {
+		return connector.Validate(ctx, config)
+	}
 	// Validate connection
 	if err := connector.Validate(ctx, config); err != nil {
 		// Update data source with error
@@ -401,6 +455,13 @@ func (s *DataSourceService) ListAvailableResources(
 	ds, err := s.GetDataSource(ctx, dsID)
 	if err != nil {
 		return nil, err
+	}
+	if external, err := s.hasExternalBinding(ctx, dsID); err != nil {
+		return nil, err
+	} else if external && s.externalLifecycle != nil {
+		if _, err := s.externalLifecycle.Generation(ctx, dsID); err != nil {
+			return nil, err
+		}
 	}
 
 	// Get connector
@@ -438,6 +499,13 @@ func (s *DataSourceService) ResolveResourceAncestors(
 	if err != nil {
 		return nil, err
 	}
+	if external, err := s.hasExternalBinding(ctx, dsID); err != nil {
+		return nil, err
+	} else if external && s.externalLifecycle != nil {
+		if _, err := s.externalLifecycle.Generation(ctx, dsID); err != nil {
+			return nil, err
+		}
+	}
 
 	connector, err := s.connectorRegistry.ResolveConnector(ctx, ds)
 	if err != nil {
@@ -474,6 +542,13 @@ func (s *DataSourceService) ManualSync(ctx context.Context, dsID string) (*types
 	if err != nil {
 		return nil, err
 	}
+	var generation uint64
+	if isExternal && s.externalLifecycle != nil {
+		generation, err = s.externalLifecycle.Generation(ctx, ds.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Create sync log
 	syncLog := &types.SyncLog{
@@ -490,12 +565,13 @@ func (s *DataSourceService) ManualSync(ctx context.Context, dsID string) (*types
 
 	// Enqueue sync task
 	payload := &types.DataSourceSyncPayload{
-		DataSourceID: dsID,
-		TenantID:     ds.TenantID,
-		SyncLogID:    syncLog.ID,
-		ForceFull:    false,
-		Initiator:    types.TaskInitiatorFromContext(ctx),
-		Trigger:      "manual",
+		DataSourceID:     dsID,
+		TenantID:         ds.TenantID,
+		SyncLogID:        syncLog.ID,
+		ForceFull:        false,
+		Initiator:        types.TaskInitiatorFromContext(ctx),
+		Trigger:          "manual",
+		PluginGeneration: generation,
 	}
 	langfuse.InjectTracing(ctx, payload)
 
@@ -537,6 +613,11 @@ func (s *DataSourceService) ManualSync(ctx context.Context, dsID string) (*types
 
 // PauseDataSource pauses a data source's scheduled syncs
 func (s *DataSourceService) PauseDataSource(ctx context.Context, id string) error {
+	if external, err := s.hasExternalBinding(ctx, id); err != nil {
+		return err
+	} else if external && s.externalLifecycle != nil {
+		return s.externalLifecycle.SetEnabled(ctx, id, false)
+	}
 	ds, err := s.GetDataSource(ctx, id)
 	if err != nil {
 		return err
@@ -559,6 +640,11 @@ func (s *DataSourceService) PauseDataSource(ctx context.Context, id string) erro
 
 // ResumeDataSource resumes a paused data source
 func (s *DataSourceService) ResumeDataSource(ctx context.Context, id string) error {
+	if external, err := s.hasExternalBinding(ctx, id); err != nil {
+		return err
+	} else if external && s.externalLifecycle != nil {
+		return s.externalLifecycle.SetEnabled(ctx, id, true)
+	}
 	ds, err := s.GetDataSource(ctx, id)
 	if err != nil {
 		return err
@@ -624,6 +710,26 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 			_ = s.syncLogRepo.Update(ctx, syncLog)
 		}
 		return nil
+	}
+
+	if external, routeErr := s.hasExternalBinding(ctx, ds.ID); routeErr != nil {
+		return routeErr
+	} else if external && s.externalLifecycle != nil {
+		if task.Type() != types.TypePluginDataSourceSync {
+			return fmt.Errorf("external datasource requires QueuePlugin task")
+		}
+		var done func()
+		ctx, done, err = s.externalLifecycle.BeginSync(ctx, ds.ID, payload.PluginGeneration)
+		if err != nil {
+			if log, lookupErr := s.syncLogRepo.FindByID(ctx, payload.SyncLogID); lookupErr == nil {
+				log.Status = types.SyncLogStatusFailed
+				log.ErrorMessage = "external source not ready or generation stale"
+				log.FinishedAt = timePtr(time.Now())
+				_ = s.syncLogRepo.UpdateResult(ctx, log)
+			}
+			return err
+		}
+		defer done()
 	}
 
 	// Get sync log
@@ -1053,10 +1159,19 @@ func (h *streamSyncHandler) Checkpoint(ctx context.Context, cursor *types.SyncCu
 	if err != nil {
 		return err
 	}
-	h.ds.LastSyncCursor = cursorJSON
-	if err := h.svc.dsRepo.UpdateSyncState(ctx, h.ds); err != nil {
+	// Do not let a failed checkpoint leak into the final failure-status write.
+	next := *h.ds
+	next.LastSyncCursor = cursorJSON
+	persist := func() error { return h.svc.dsRepo.UpdateSyncState(ctx, &next) }
+	if h.external && h.svc.externalLifecycle != nil {
+		persist = func() error {
+			return h.svc.externalLifecycle.WithSync(ctx, h.ds.ID, func() error { return h.svc.dsRepo.UpdateSyncState(ctx, &next) })
+		}
+	}
+	if err := persist(); err != nil {
 		return err
 	}
+	h.ds.LastSyncCursor = cursorJSON
 
 	// Best-effort live progress; a failure here must not abort the sync.
 	h.syncLog.ItemsTotal = h.result.Total
@@ -1095,7 +1210,14 @@ func (s *DataSourceService) processSyncStreaming(
 
 	forceFull := payload.ForceFull || ds.SyncMode == types.SyncModeFull
 	attempt, _ := asynq.GetRetryCount(ctx)
-	startCursor, err := streamStartCursor(ds, forceFull, attempt)
+	external := false
+	if marker, ok := sc.(datasource.ExternalConnector); ok {
+		external = marker.IsExternal()
+	}
+	if external {
+		ctx = datasource.WithExternalForceFull(ctx, forceFull)
+	}
+	startCursor, err := streamStartCursor(ds, forceFull && !external, attempt)
 	if err != nil {
 		logger.Errorf(ctx, "failed to parse sync cursor: %v", err)
 		s.updateSyncRunResult(ctx, ds, syncLog, &types.SyncResult{}, nil,
@@ -1104,10 +1226,6 @@ func (s *DataSourceService) processSyncStreaming(
 	}
 
 	result := &types.SyncResult{}
-	external := false
-	if marker, ok := sc.(datasource.ExternalConnector); ok {
-		external = marker.IsExternal()
-	}
 	if external && s.externalIngestor == nil {
 		err := fmt.Errorf("external revision ingestor is not configured")
 		s.updateSyncRunResult(ctx, ds, syncLog, result, nil, types.SyncLogStatusFailed, err.Error(), wasPaused)
@@ -1134,7 +1252,7 @@ func (s *DataSourceService) processSyncStreaming(
 	}
 
 	// Persist the final cursor for the next incremental sync.
-	if nextCursor != nil {
+	if nextCursor != nil && !external {
 		if cursorJSON, cerr := nextCursor.ToJSON(); cerr == nil {
 			ds.LastSyncCursor = cursorJSON
 		}
@@ -1183,7 +1301,11 @@ func (s *DataSourceService) updateSyncRunResult(
 	syncLog.FinishedAt = timePtr(time.Now().UTC())
 	syncLog.ErrorMessage = errorMessage
 	syncLog.Result = resultJSON
-	if err := s.syncLogRepo.UpdateResult(ctx, syncLog); err != nil {
+	// A cancelled/disabled run must still leave a terminal diagnostic. This
+	// context is NOT used for Cursor acceptance or desired-state writes below.
+	logCtx, cancelLog := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelLog()
+	if err := s.syncLogRepo.UpdateResult(logCtx, syncLog); err != nil {
 		logger.Errorf(ctx, "failed to update sync log: %v", err)
 	}
 
@@ -1198,7 +1320,13 @@ func (s *DataSourceService) updateSyncRunResult(
 	}
 	ds.ErrorMessage = errorMessage
 	ds.LastSyncResult = resultJSON
-	if err := s.dsRepo.UpdateSyncState(ctx, ds); err != nil {
+	persist := func() error { return s.dsRepo.UpdateSyncState(ctx, ds) }
+	if external, _ := s.hasExternalBinding(ctx, ds.ID); external && s.externalLifecycle != nil {
+		persist = func() error {
+			return s.externalLifecycle.WithSync(ctx, ds.ID, func() error { return s.dsRepo.UpdateSyncState(ctx, ds) })
+		}
+	}
+	if err := persist(); err != nil {
 		logger.Errorf(ctx, "failed to update data source: %v", err)
 	}
 	action := types.AuditActionDataSourceSyncCompleted

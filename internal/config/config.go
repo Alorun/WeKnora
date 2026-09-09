@@ -17,6 +17,7 @@ import (
 
 // Config 应用程序总配置
 type Config struct {
+	ExternalPlugins ExternalPluginsConfig  `yaml:"external_plugins" json:"external_plugins"`
 	Conversation    *ConversationConfig    `yaml:"conversation"     json:"conversation"`
 	Server          *ServerConfig          `yaml:"server"           json:"server"`
 	KnowledgeBase   *KnowledgeBaseConfig   `yaml:"knowledge_base"   json:"knowledge_base"`
@@ -537,6 +538,9 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("unable to decode config into struct: %w", err)
 	}
 	fmt.Printf("Using configuration file: %s\n", viper.ConfigFileUsed())
+	if err := cfg.ExternalPlugins.Validate(); err != nil {
+		return nil, err
+	}
 
 	// 加载提示词模板（从目录或配置文件）
 	configDir := filepath.Dir(viper.ConfigFileUsed())

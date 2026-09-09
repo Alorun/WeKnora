@@ -2,11 +2,13 @@ package datasource
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"testing"
 	"time"
 
+	core "github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/types"
 	pluginv1 "github.com/Tencent/WeKnora/pkg/plugin/proto/v1"
 	"github.com/stretchr/testify/require"
@@ -55,6 +57,23 @@ func (adapterDataSource) Sync(_ *pluginv1.SyncRequest, stream grpc.ServerStreami
 
 type itemErrorDataSource struct {
 	adapterDataSource
+}
+
+type forceFullDataSource struct{ adapterDataSource }
+
+func (forceFullDataSource) Sync(req *pluginv1.SyncRequest, stream grpc.ServerStreamingServer[pluginv1.SyncEvent]) error {
+	var cursor types.SyncCursor
+	if !req.ForceFull || json.Unmarshal(req.CursorJson, &cursor) != nil || cursor.ConnectorCursor["round"] != float64(7) {
+		return errors.New("force_full lost the opaque revision round")
+	}
+	return nil
+}
+
+func TestExternalForceFullRetainsOpaqueCursor(t *testing.T) {
+	_, adapter := adapterFixtureWithDataSource(t, forceFullDataSource{})
+	ctx := core.WithExternalForceFull(context.Background(), true)
+	_, err := adapter.FetchStream(ctx, &types.DataSourceConfig{}, &types.SyncCursor{ConnectorCursor: map[string]any{"round": 7}}, &recordingStreamHandler{})
+	require.NoError(t, err)
 }
 
 func (itemErrorDataSource) Sync(_ *pluginv1.SyncRequest, stream grpc.ServerStreamingServer[pluginv1.SyncEvent]) error {

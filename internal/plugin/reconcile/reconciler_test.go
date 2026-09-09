@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -116,6 +117,34 @@ func (reconcileSpecs) BuildInstanceSpec(_ context.Context, installation control.
 
 type revisionRecorder struct{ pending, cleanup int }
 
+type unavailableSpecs struct{ calls int }
+
+func (s *unavailableSpecs) BuildInstanceSpec(context.Context, control.PluginInstallation, control.DataSourcePluginBinding) (pluginruntime.InstanceSpec, error) {
+	s.calls++
+	return pluginruntime.InstanceSpec{}, errors.New("grant permanently unavailable")
+}
+
+func TestPermanentFailureHasBoundedRetryAndGenerationResetsIt(t *testing.T) {
+	resolver := plugindatasource.NewResolver()
+	st := &reconcileStore{
+		binding:      control.DataSourcePluginBinding{DataSourceID: "ds", InstallationID: "install", Generation: 1},
+		installation: control.PluginInstallation{ID: "install", Active: true, Enabled: true, InstallStatus: control.InstallStatusInstalled},
+	}
+	specs := &unavailableSpecs{}
+	r := New(st, &reconcileController{resolver: resolver}, reconcileRuntime{}, &reconcileBackend{}, resolver, specs, nil)
+	for n := 0; n < 6; n++ {
+		_ = r.ReconcileOnce(context.Background())
+		entry := r.retries["ds"]
+		entry.next = time.Time{} // bounded retry without wall-clock sleeps
+		r.retries["ds"] = entry
+	}
+	require.Equal(t, 3, specs.calls)
+	require.Equal(t, control.StateNotReady, st.state)
+	st.binding.Generation++
+	require.ErrorContains(t, r.ReconcileOnce(context.Background()), "grant permanently unavailable")
+	require.Equal(t, 4, specs.calls)
+}
+
 func (r *revisionRecorder) ReconcilePending(context.Context, int) error  { r.pending++; return nil }
 func (r *revisionRecorder) CleanupSuperseded(context.Context, int) error { r.cleanup++; return nil }
 
@@ -124,7 +153,7 @@ func TestReconcilerReplacesOldGenerationAndCleansOrphan(t *testing.T) {
 	require.NoError(t, resolver.Publish("ds-1", 1, &reconcileHandle{id: "old-handle", dsID: "ds-1", generation: 1}))
 	store := &reconcileStore{
 		binding:      control.DataSourcePluginBinding{DataSourceID: "ds-1", InstallationID: "install-1", ExtensionID: "local", Generation: 2},
-		installation: control.PluginInstallation{ID: "install-1", PluginID: "test.local", Version: "1.0.0", Active: true, Enabled: true},
+		installation: control.PluginInstallation{ID: "install-1", PluginID: "test.local", Version: "1.0.0", Active: true, Enabled: true, InstallStatus: control.InstallStatusInstalled},
 	}
 	controller := &reconcileController{resolver: resolver}
 	backend := &reconcileBackend{instances: []pluginruntime.BackendInstance{{ID: "orphan", Metadata: map[string]string{"data_source_id": "orphan-ds"}}}}
@@ -144,7 +173,7 @@ func TestReconcilerInspectsAndSafelyRebuildsAfterControllerRestart(t *testing.T)
 	resolver := plugindatasource.NewResolver()
 	store := &reconcileStore{
 		binding:      control.DataSourcePluginBinding{DataSourceID: "ds-1", InstallationID: "install-1", ExtensionID: "local", Generation: 1},
-		installation: control.PluginInstallation{ID: "install-1", PluginID: "test.local", Version: "1.0.0", Active: true, Enabled: true},
+		installation: control.PluginInstallation{ID: "install-1", PluginID: "test.local", Version: "1.0.0", Active: true, Enabled: true, InstallStatus: control.InstallStatusInstalled},
 	}
 	controller := &reconcileController{resolver: resolver}
 	backend := &reconcileBackend{instances: []pluginruntime.BackendInstance{{

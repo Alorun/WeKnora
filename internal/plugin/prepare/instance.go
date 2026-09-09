@@ -134,20 +134,8 @@ func (b Builder) BuildInstanceSpec(ctx context.Context, installation control.Plu
 	if selected, ok := config.Settings["source_grant"]; ok && selected != g.ID {
 		return spec, errors.New("configuration references a different grant")
 	}
-	compiler := jsonschema.NewCompiler()
-	if err := compiler.AddResource("urn:plugin:config", m.Spec.ConfigSchema); err != nil {
+	if err := ValidateSettings(m, config.Settings); err != nil {
 		return spec, err
-	}
-	schema, err := compiler.Compile("urn:plugin:config")
-	if err != nil {
-		return spec, err
-	}
-	settings := config.Settings
-	if settings == nil {
-		settings = map[string]any{}
-	}
-	if err := schema.Validate(settings); err != nil {
-		return spec, errors.New("data source settings do not satisfy configSchema")
 	}
 	configJSON, err := json.Marshal(config)
 	if err != nil {
@@ -176,6 +164,25 @@ func (b Builder) BuildInstanceSpec(ctx context.Context, installation control.Plu
 		Artifact: p.Artifact, Grant: grant, RuntimeAppPath: app, RuntimeHostPath: host,
 		Permissions: pluginruntime.EffectivePermissions{Network: m.Spec.Permissions.Network, Filesystem: m.Spec.Permissions.Filesystem}, Resources: limits}
 	return spec, spec.Validate()
+}
+
+// ValidateSettings shares the same schema check between API creation and Start.
+func ValidateSettings(m control.Manifest, settings map[string]any) error {
+	compiler := jsonschema.NewCompiler()
+	if err := compiler.AddResource("urn:plugin:config", m.Spec.ConfigSchema); err != nil {
+		return err
+	}
+	schema, err := compiler.Compile("urn:plugin:config")
+	if err != nil {
+		return err
+	}
+	if settings == nil {
+		settings = map[string]any{}
+	}
+	if err := schema.Validate(settings); err != nil {
+		return errors.New("data source settings do not satisfy configSchema")
+	}
+	return nil
 }
 
 // The existing Manifest bounds and the administrator ceiling are both hard

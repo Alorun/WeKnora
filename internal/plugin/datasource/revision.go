@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"mime/multipart"
 	"net/textproto"
+	"sync"
 
 	core "github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/plugin/control"
@@ -31,14 +32,22 @@ type RevisionStore interface {
 }
 
 type RevisionProcessor struct {
-	store      RevisionStore
-	knowledge  interfaces.KnowledgeService
-	enqueuer   interfaces.TaskEnqueuer
-	maxContent int
+	reconcileMu sync.Mutex // task-completion callbacks and periodic recovery
+	store       RevisionStore
+	knowledge   interfaces.KnowledgeService
+	enqueuer    interfaces.TaskEnqueuer
+	maxContent  int
+	loadTenant  func(context.Context, uint64) (*types.Tenant, error)
 }
 
 func NewRevisionProcessor(store RevisionStore, knowledge interfaces.KnowledgeService, enqueuer interfaces.TaskEnqueuer) *RevisionProcessor {
 	return &RevisionProcessor{store: store, knowledge: knowledge, enqueuer: enqueuer, maxContent: pluginsdk.MaxDocumentBytes}
+}
+
+// SetTenantLoader is wired once before workers start. Background recovery must
+// reconstruct the same trusted tenant context as the existing deletion worker.
+func (p *RevisionProcessor) SetTenantLoader(load func(context.Context, uint64) (*types.Tenant, error)) {
+	p.loadTenant = load
 }
 
 func (p *RevisionProcessor) AcceptExternalItem(
@@ -139,6 +148,8 @@ func (p *RevisionProcessor) acceptDelete(
 // ReconcilePending re-arms lost parsing tasks and commits completed revisions.
 // It is safe to call repeatedly on startup and from a single controller loop.
 func (p *RevisionProcessor) ReconcilePending(ctx context.Context, limit int) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
 	revisions, err := p.store.ListPendingRevisions(ctx, limit)
 	if err != nil {
 		return err
@@ -156,11 +167,12 @@ func (p *RevisionProcessor) ReconcilePending(ctx context.Context, limit int) err
 		}
 		switch knowledge.ParseStatus {
 		case types.ParseStatusCompleted:
-			if metadataErr := p.setRevisionMetadataState(ctx, knowledge, control.RevisionActive); metadataErr != nil {
-				result = errors.Join(result, metadataErr)
-				continue
-			}
+			// Metadata and visibility change in the Store activation transaction,
+			// never before it: a rejected/obsolete completion remains hidden.
 			oldKnowledgeID, activateErr := p.store.ActivateRevision(ctx, revision.DataSourceID, revision.ExternalID, revision.Revision)
+			if errors.Is(activateErr, pluginstore.ErrSourceGone) {
+				activateErr = p.store.FailRevision(ctx, revision, activateErr.Error())
+			}
 			result = errors.Join(result, activateErr)
 			if activateErr == nil && oldKnowledgeID != nil {
 				result = errors.Join(result, p.cleanupKnowledge(ctx, knowledge.TenantID, *oldKnowledgeID))
@@ -183,6 +195,8 @@ func (p *RevisionProcessor) ReconcilePending(ctx context.Context, limit int) err
 }
 
 func (p *RevisionProcessor) CleanupSuperseded(ctx context.Context, limit int) error {
+	p.reconcileMu.Lock()
+	defer p.reconcileMu.Unlock()
 	revisions, err := p.store.ListSupersededRevisions(ctx, limit)
 	if err != nil {
 		return err
@@ -201,24 +215,8 @@ func (p *RevisionProcessor) CleanupSuperseded(ctx context.Context, limit int) er
 	return result
 }
 
-func (p *RevisionProcessor) setRevisionMetadataState(ctx context.Context, knowledge *types.Knowledge, state string) error {
-	current := knowledge.GetMetadata()
-	if current == nil {
-		current = make(map[string]string)
-	}
-	if current["plugin_revision_state"] == state {
-		return nil
-	}
-	current["plugin_revision_state"] = state
-	encoded, err := json.Marshal(current)
-	if err != nil {
-		return err
-	}
-	knowledge.Metadata = encoded
-	return p.knowledge.GetRepository().UpdateKnowledge(ctx, knowledge)
-}
-
 func (p *RevisionProcessor) enqueueRevision(ctx context.Context, knowledge *types.Knowledge, revision *control.DataSourceRevision) error {
+	ctx = context.WithValue(ctx, types.TenantIDContextKey, knowledge.TenantID)
 	task, options, err := p.knowledge.BuildDocumentProcessTask(ctx, knowledge.ID)
 	if err != nil {
 		return err
@@ -233,6 +231,20 @@ func (p *RevisionProcessor) enqueueRevision(ctx context.Context, knowledge *type
 }
 
 func (p *RevisionProcessor) cleanupKnowledge(ctx context.Context, tenantID uint64, knowledgeID string) error {
+	if p.loadTenant == nil {
+		return errors.New("revision cleanup tenant loader is not configured")
+	}
+	tenant, err := p.loadTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	if tenant == nil || tenant.ID != tenantID {
+		return errors.New("revision cleanup tenant mismatch")
+	}
+	// DeleteKnowledge adjusts this request-local storage counter.
+	localTenant := *tenant
+	ctx = context.WithValue(ctx, types.TenantIDContextKey, tenantID)
+	ctx = context.WithValue(ctx, types.TenantInfoContextKey, &localTenant)
 	if err := p.knowledge.DeleteKnowledge(ctx, knowledgeID); err != nil {
 		return err
 	}

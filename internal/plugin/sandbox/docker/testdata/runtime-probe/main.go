@@ -81,10 +81,16 @@ func main() {
 }
 
 func (p *probe) Sync(req *pb.SyncRequest, stream grpc.ServerStreamingServer[pb.SyncEvent]) error {
-	var cfg struct{ Mode string }
+	var cfg struct {
+		Mode     string
+		Settings struct{ Mode string }
+	}
 	if err := json.Unmarshal(req.ConfigJson, &cfg); err != nil {
 		return err
 	}
+	if cfg.Mode == "" {
+		cfg.Mode = cfg.Settings.Mode
+	} // normal DataSourceConfig in C3 application tests
 	result := map[string]any{}
 	switch cfg.Mode {
 	case "network":
@@ -207,5 +213,5 @@ func (p *probe) Sync(req *pb.SyncRequest, stream grpc.ServerStreamingServer[pb.S
 	if err != nil {
 		return err
 	}
-	return stream.Send(&pb.SyncEvent{Event: &pb.SyncEvent_Upsert{Upsert: &pb.DocumentUpsert{ExternalId: "probe", Revision: "1", Content: body, ContentType: "application/json"}}})
+	return stream.Send(&pb.SyncEvent{Event: &pb.SyncEvent_Upsert{Upsert: &pb.DocumentUpsert{ExternalId: "probe", Revision: "1", FileName: "probe.json", Content: body, ContentType: "application/json"}}})
 }

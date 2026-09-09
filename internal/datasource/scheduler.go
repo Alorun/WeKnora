@@ -25,14 +25,19 @@ import (
 //  2. asynq.TaskID  — deterministic ID per (dataSourceID, minute). Redis ensures
 //     only one task with a given ID is enqueued. Losers get ErrTaskIDConflict.
 type Scheduler struct {
-	cron         *cron.Cron
-	dsRepo       interfaces.DataSourceRepository
-	syncLogRepo  interfaces.SyncLogRepository
-	taskEnqueuer interfaces.TaskEnqueuer
-	connectors   *ConnectorRegistry
+	cron              *cron.Cron
+	dsRepo            interfaces.DataSourceRepository
+	syncLogRepo       interfaces.SyncLogRepository
+	taskEnqueuer      interfaces.TaskEnqueuer
+	connectors        *ConnectorRegistry
+	externalLifecycle ExternalLifecycle
 
 	mu      sync.Mutex
 	entries map[string]cron.EntryID // dataSourceID → cron entry ID
+}
+
+func (s *Scheduler) SetExternalLifecycle(lifecycle ExternalLifecycle) {
+	s.externalLifecycle = lifecycle
 }
 
 func (s *Scheduler) SetConnectorRegistry(connectors *ConnectorRegistry) {
@@ -150,6 +155,21 @@ func (s *Scheduler) triggerSync(dataSourceID string, tenantID uint64) {
 		logger.Infof(ctx, "[Scheduler] skipping sync for ds=%s (not active or not found)", dataSourceID)
 		return
 	}
+	var generation uint64
+	if s.connectors != nil && s.externalLifecycle != nil {
+		external, err := s.connectors.HasExternalBinding(ctx, dataSourceID)
+		if err != nil {
+			logger.Warnf(ctx, "[Scheduler] binding lookup failed: %v", err)
+			return
+		}
+		if external {
+			generation, err = s.externalLifecycle.Generation(ctx, dataSourceID)
+			if err != nil {
+				logger.Warnf(ctx, "[Scheduler] external source not ready: %v", err)
+				return
+			}
+		}
+	}
 
 	// Layer 1: prevent overlap with a still-running sync
 	if running, _ := s.syncLogRepo.HasRunningSync(ctx, dataSourceID); running {
@@ -169,11 +189,12 @@ func (s *Scheduler) triggerSync(dataSourceID string, tenantID uint64) {
 	}
 
 	payload := &types.DataSourceSyncPayload{
-		DataSourceID: dataSourceID,
-		TenantID:     tenantID,
-		SyncLogID:    syncLog.ID,
-		ForceFull:    false,
-		Trigger:      "schedule",
+		DataSourceID:     dataSourceID,
+		TenantID:         tenantID,
+		SyncLogID:        syncLog.ID,
+		ForceFull:        false,
+		Trigger:          "schedule",
+		PluginGeneration: generation,
 	}
 	langfuse.InjectTracing(ctx, payload)
 	payloadJSON, _ := json.Marshal(payload)

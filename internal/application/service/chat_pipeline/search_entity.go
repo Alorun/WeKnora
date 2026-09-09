@@ -164,6 +164,9 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 	}
 	var entityResults []*types.SearchResult
 	for _, chunk := range chunks {
+		if !searchutil.PluginKnowledgeVisible(knowledgeMap[chunk.KnowledgeID]) {
+			continue
+		}
 		searchResult := chunk2SearchResult(chunk, knowledgeMap[chunk.KnowledgeID])
 		entityResults = append(entityResults, searchResult)
 	}

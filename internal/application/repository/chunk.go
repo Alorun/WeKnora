@@ -54,13 +54,18 @@ func (r *chunkRepository) CreateChunks(ctx context.Context, chunks []*types.Chun
 	db := r.db.WithContext(ctx)
 
 	// SQLite doesn't support autoIncrement on non-PK columns,
-	// so we must pre-assign SeqIDs manually (safe: single connection).
+	// so sequence allocation and insertion must hold the SAME transaction.
+	// A single connection alone does not prevent two goroutines interleaving
+	// SELECT MAX then INSERT when the statements acquire it separately.
 	// PostgreSQL / MySQL use DB sequences — skip to avoid duplicate key
 	// races under concurrent inserts.
 	if db.Dialector.Name() == "sqlite" {
-		if err := types.AssignChunkSeqIDs(db, chunks); err != nil {
-			return fmt.Errorf("failed to assign chunk seq_ids: %w", err)
-		}
+		return db.Transaction(func(tx *gorm.DB) error {
+			if err := types.AssignChunkSeqIDs(tx, chunks); err != nil {
+				return fmt.Errorf("failed to assign chunk seq_ids: %w", err)
+			}
+			return tx.Select("*").CreateInBatches(chunks, 100).Error
+		})
 	}
 
 	// Select("*") ensures zero-value fields (IsEnabled=false, Flags=0) are

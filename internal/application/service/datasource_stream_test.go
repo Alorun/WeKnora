@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -15,13 +16,26 @@ import (
 type recordingDSRepo struct {
 	kbDeleteDSRepo
 	updated []*types.DataSource
+	fail    bool
 }
 
 func (r *recordingDSRepo) UpdateSyncState(_ context.Context, ds *types.DataSource) error {
+	if r.fail {
+		return errors.New("checkpoint storage unavailable")
+	}
 	// Snapshot the fields a checkpoint is expected to persist.
 	cp := *ds
 	r.updated = append(r.updated, &cp)
 	return nil
+}
+
+func TestFailedCheckpointCannotLeakIntoFinalStatusWrite(t *testing.T) {
+	repo := &recordingDSRepo{fail: true}
+	ds := &types.DataSource{ID: "ds-1", LastSyncCursor: types.JSON(`{"connector_cursor":{"old":true}}`)}
+	before := append(types.JSON(nil), ds.LastSyncCursor...)
+	h := newStreamHandler(&DataSourceService{dsRepo: repo}, ds, &types.SyncResult{}, &types.SyncLog{})
+	require.Error(t, h.Checkpoint(context.Background(), &types.SyncCursor{ConnectorCursor: map[string]interface{}{"new": true}}))
+	require.Equal(t, before, ds.LastSyncCursor, "subsequent failure-status write must retain old Cursor")
 }
 
 func makeConnectorCursor(t *testing.T, spaceNodeTimes map[string]map[string]string) types.JSON {

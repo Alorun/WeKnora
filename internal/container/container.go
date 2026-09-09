@@ -77,6 +77,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
 	pluginbuiltin "github.com/Tencent/WeKnora/internal/plugin/builtin"
 	plugincatalog "github.com/Tencent/WeKnora/internal/plugin/catalog"
+	plugincontroller "github.com/Tencent/WeKnora/internal/plugin/controller"
 	plugindatasource "github.com/Tencent/WeKnora/internal/plugin/datasource"
 	pluginmanager "github.com/Tencent/WeKnora/internal/plugin/manager"
 	pluginstore "github.com/Tencent/WeKnora/internal/plugin/store"
@@ -116,6 +117,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(initFileService))
 	must(container.Provide(initRedisClient))
 	must(container.Provide(initAntsPool))
+	must(container.Invoke(registerPluginInfrastructureCleanup))
 
 	must(container.Invoke(registerLangfuseCleanup))
 
@@ -261,6 +263,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewVectorStoreRepository))
 	must(container.Provide(NewEngineFactory))
 	must(container.Provide(newPluginManager))
+	must(container.Provide(plugincontroller.New))
 	must(container.Invoke(startBuiltinPluginControlPlane))
 	must(container.Provide(repository.NewWebSearchProviderRepository))
 	must(container.Provide(repository.NewStorageBackendRepository))
@@ -322,6 +325,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	redisAvailable := os.Getenv("REDIS_ADDR") != ""
 	if redisAvailable {
 		must(container.Provide(router.NewAsyncqClient, dig.As(new(interfaces.TaskEnqueuer))))
+		must(container.Invoke(registerPluginEnqueuerCleanup))
 		// Dedicated pools guarantee capacity for each stage. The shared pool
 		// additionally subscribes to core/enrichment queues to provide elastic
 		// borrowing while post-process and maintenance remain hard-isolated.
@@ -363,6 +367,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(datasource.NewScheduler))
 	must(container.Provide(service.NewDataSourceService))
 	must(container.Invoke(wireExternalDataSourceControlPlane))
+	must(container.Invoke(startExternalPluginController))
 	must(container.Invoke(startDataSourceScheduler))
 	logger.Debugf(ctx, "[Container] Data source sync framework registered")
 	must(container.Invoke(startAuditLogRetention))
@@ -443,6 +448,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 
 	// Data source handler
 	must(container.Provide(handler.NewDataSourceHandler))
+	must(container.Provide(handler.NewPluginHandler))
 	// Wiki page handler
 	must(container.Provide(handler.NewWikiPageHandler))
 	// IM integration
@@ -467,6 +473,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	} else {
 		must(container.Invoke(router.RegisterSyncHandlers))
 	}
+	must(container.Invoke(registerExternalPluginShutdown))
 	// Wiki operation rows are durable, while their wake-up triggers may be
 	// lost across a process restart (always in Lite mode, and in Redis mode if
 	// persistence succeeded immediately before trigger enqueue failed). Re-arm
@@ -1648,7 +1655,10 @@ func wireExternalDataSourceControlPlane(
 	revisions *plugindatasource.RevisionProcessor,
 	scheduler *datasource.Scheduler,
 	dataSourceService interfaces.DataSourceService,
+	controller *plugincontroller.Controller,
+	tenants interfaces.TenantRepository,
 ) error {
+	revisions.SetTenantLoader(tenants.GetTenantByID)
 	if err := connectors.SetExternalResolver(router); err != nil {
 		return err
 	}
@@ -1659,8 +1669,28 @@ func wireExternalDataSourceControlPlane(
 	if !ok {
 		return fmt.Errorf("data source service does not support external revision ingestion")
 	}
-	configurable.SetExternalRevisionIngestor(revisions)
+	configurable.SetExternalRevisionIngestor(controller)
+	lifecycle, ok := dataSourceService.(interface {
+		SetExternalLifecycle(datasource.ExternalLifecycle)
+	})
+	if !ok {
+		return fmt.Errorf("data source lifecycle seam unavailable")
+	}
+	lifecycle.SetExternalLifecycle(controller)
+	scheduler.SetExternalLifecycle(controller)
 	return nil
+}
+
+func startExternalPluginController(controller *plugincontroller.Controller) error {
+	version := strings.TrimSpace(handler.Version)
+	if version == "unknown" {
+		version = ""
+	}
+	return controller.Start(context.Background(), version)
+}
+
+func registerExternalPluginShutdown(controller *plugincontroller.Controller, cleaner interfaces.ResourceCleaner) {
+	cleaner.RegisterWithName("ExternalPluginController", controller.Close)
 }
 
 func newPluginManager(

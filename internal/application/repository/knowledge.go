@@ -315,6 +315,15 @@ func (r *knowledgeRepository) UpdateKnowledge(ctx context.Context, knowledge *ty
 	if knowledge.CustomMetadata == nil {
 		omit = append(append([]string{}, omitFieldsOnUpdate...), "custom_metadata")
 	}
+	if knowledge.GetMetadata()["plugin_revision_state"] != "" {
+		// Only the revision transaction owns external Knowledge visibility.
+		// Never let a late worker Save UPSERT a deleted/superseded row or
+		// overwrite an activation with its stale pending metadata snapshot.
+		omit = append(append([]string{}, omit...), "enable_status", "metadata")
+		return r.db.WithContext(ctx).Model(&types.Knowledge{}).Where("id = ?", knowledge.ID).
+			Where("EXISTS (SELECT 1 FROM datasource_plugin_revisions r JOIN data_sources d ON d.id = r.data_source_id WHERE r.knowledge_id = knowledges.id AND r.state IN (?, ?) AND d.deleted_at IS NULL)", "pending", "active").
+			Select("*").Omit(omit...).Updates(knowledge).Error
+	}
 	err := r.db.WithContext(ctx).Omit(omit...).Save(knowledge).Error
 	return err
 }

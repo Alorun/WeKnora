@@ -9,8 +9,8 @@ import (
 
 func TestPostgreSQLAndSQLitePluginMigrationStructuresMatch(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", "..", ".."))
-	postgres := readMigration(t, filepath.Join(root, "migrations", "versioned", "000091_plugin_control_plane.up.sql"))
-	sqlite := readMigration(t, filepath.Join(root, "migrations", "sqlite", "000013_plugin_control_plane.up.sql"))
+	postgres := readMigration(t, filepath.Join(root, "migrations", "versioned", "000092_plugin_control_plane.up.sql"))
+	sqlite := readMigration(t, filepath.Join(root, "migrations", "sqlite", "000014_plugin_control_plane.up.sql"))
 
 	tables := map[string][]string{
 		"plugin_installations": {
@@ -52,6 +52,26 @@ func TestPostgreSQLAndSQLitePluginMigrationStructuresMatch(t *testing.T) {
 	} {
 		if !strings.Contains(postgres, index) || !strings.Contains(sqlite, index) {
 			t.Errorf("index %s is not present in both migrations", index)
+		}
+	}
+}
+
+func TestMigrationNumbersAreUniqueInEachDatabase(t *testing.T) {
+	for _, directory := range []string{"sqlite", "versioned"} {
+		entries, err := os.ReadDir(filepath.Join("..", "..", "..", "migrations", directory))
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := map[string]string{}
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), ".up.sql") {
+				continue
+			}
+			number := strings.SplitN(entry.Name(), "_", 2)[0]
+			if previous, ok := seen[number]; ok {
+				t.Fatalf("%s duplicate migration: %s / %s", directory, previous, entry.Name())
+			}
+			seen[number] = entry.Name()
 		}
 	}
 }

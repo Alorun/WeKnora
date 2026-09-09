@@ -13,8 +13,8 @@ import (
 // PathMapping explicitly maps the path visible to a Controller to the source
 // path interpreted by the local Docker daemon.
 type PathMapping struct {
-	AppRoot  string `json:"app_root"`
-	HostRoot string `json:"host_root"`
+	AppRoot  string `json:"app_root" yaml:"app_root"`
+	HostRoot string `json:"host_root" yaml:"host_root"`
 }
 
 func (m PathMapping) ValidatePair(appPath, hostPath string) error {

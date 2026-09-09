@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -11,11 +12,13 @@ import (
 	"github.com/Tencent/WeKnora/internal/plugin/control"
 	"github.com/Tencent/WeKnora/internal/types"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var (
 	ErrNotFound       = errors.New("plugin record not found")
 	ErrRevisionExists = errors.New("datasource revision already exists")
+	ErrSourceGone     = errors.New("revision data source was deleted")
 )
 
 type Store struct {
@@ -102,12 +105,13 @@ func (s *Store) UpdateBindingObserved(
 
 func (s *Store) GetDataSourceStatus(ctx context.Context, dataSourceID string) (string, error) {
 	var status string
-	result := s.db.WithContext(ctx).Table("data_sources").Select("status").Where("id = ?", dataSourceID).Scan(&status)
+	result := s.db.WithContext(ctx).Table("data_sources").Select("status").Where("id = ? AND deleted_at IS NULL", dataSourceID).Scan(&status)
 	if result.Error != nil {
 		return "", result.Error
 	}
 	if result.RowsAffected == 0 {
-		return "", ErrNotFound
+		// A missing source is not desired: still stop its surviving instance.
+		return types.DataSourceStatusPaused, nil
 	}
 	return status, nil
 }
@@ -175,6 +179,9 @@ func (s *Store) CreatePendingRevisionWithKnowledge(
 		return errors.New("revision and knowledge identity are required")
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockLiveSource(tx, revision.DataSourceID); err != nil {
+			return err
+		}
 		var count int64
 		if err := tx.Model(&control.DataSourceRevision{}).Where(
 			"data_source_id = ? AND external_id = ? AND revision = ?",
@@ -184,6 +191,12 @@ func (s *Store) CreatePendingRevisionWithKnowledge(
 		}
 		if count != 0 {
 			return ErrRevisionExists
+		}
+		// A newer accepted revision makes older pending work obsolete, but the
+		// old ACTIVE Knowledge stays enabled until the replacement succeeds.
+		if err := tx.Model(&control.DataSourceRevision{}).Where("data_source_id = ? AND external_id = ? AND state = ?", revision.DataSourceID, revision.ExternalID, control.RevisionPending).
+			Updates(map[string]any{"state": control.RevisionSuperseded, "updated_at": time.Now()}).Error; err != nil {
+			return err
 		}
 		knowledge.EnableStatus = "disabled"
 		if err := tx.Create(knowledge).Error; err != nil {
@@ -251,6 +264,9 @@ func (s *Store) ActivateRevision(
 ) (*string, error) {
 	var oldKnowledgeID *string
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockLiveSource(tx, dataSourceID); err != nil {
+			return err
+		}
 		var current control.DataSourceRevision
 		if err := tx.Where(
 			"data_source_id = ? AND external_id = ? AND revision = ?",
@@ -263,6 +279,10 @@ func (s *Store) ActivateRevision(
 		}
 		if current.State != control.RevisionPending || current.KnowledgeID == nil {
 			return fmt.Errorf("revision is %s, expected pending", current.State)
+		}
+		var knowledge types.Knowledge
+		if err := tx.First(&knowledge, "id = ? AND parse_status = ?", *current.KnowledgeID, types.ParseStatusCompleted).Error; err != nil {
+			return err
 		}
 		var previous control.DataSourceRevision
 		previousResult := tx.Where(
@@ -295,8 +315,17 @@ func (s *Store) ActivateRevision(
 		if err := affected(result); err != nil {
 			return err
 		}
+		metadata := knowledge.GetMetadata()
+		if metadata == nil {
+			metadata = map[string]string{}
+		}
+		metadata["plugin_revision_state"] = control.RevisionActive
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
 		return tx.Model(&types.Knowledge{}).Where("id = ?", *current.KnowledgeID).
-			Updates(map[string]any{"enable_status": "enabled", "updated_at": now}).Error
+			Updates(map[string]any{"enable_status": "enabled", "metadata": types.JSON(encoded), "updated_at": now}).Error
 	})
 	return oldKnowledgeID, err
 }
@@ -306,6 +335,15 @@ func (s *Store) ActivateRevision(
 func (s *Store) SupersedeActiveForDelete(ctx context.Context, dataSourceID, externalID string) (*string, error) {
 	var knowledgeID *string
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockLiveSource(tx, dataSourceID); err != nil {
+			return err
+		}
+		// Deletes also tombstone pending revisions; late task completion must
+		// never resurrect a file that has already disappeared from the source.
+		if err := tx.Model(&control.DataSourceRevision{}).Where("data_source_id = ? AND external_id = ? AND state = ?", dataSourceID, externalID, control.RevisionPending).
+			Updates(map[string]any{"state": control.RevisionSuperseded, "updated_at": time.Now()}).Error; err != nil {
+			return err
+		}
 		var active control.DataSourceRevision
 		err := tx.Where("data_source_id = ? AND external_id = ? AND state = ?", dataSourceID, externalID, control.RevisionActive).
 			First(&active).Error
@@ -330,6 +368,15 @@ func (s *Store) SupersedeActiveForDelete(ctx context.Context, dataSourceID, exte
 		return nil
 	})
 	return knowledgeID, err
+}
+
+func lockLiveSource(tx *gorm.DB, id string) error {
+	var ds types.DataSource
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").First(&ds, "id = ?", id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrSourceGone
+	}
+	return err
 }
 
 func (s *Store) FailRevision(ctx context.Context, revision control.DataSourceRevision, lastError string) error {

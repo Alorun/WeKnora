@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"unicode/utf8"
 
@@ -12,6 +13,34 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestCreateChunks_SQLiteConcurrentSequenceAllocation(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	defer sqlDB.Close()
+	require.NoError(t, db.AutoMigrate(&types.Chunk{}))
+	repo := NewChunkRepository(db)
+	errs := make(chan error, 12)
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- repo.CreateChunks(context.Background(), []*types.Chunk{{ID: uuid.NewString(), KnowledgeID: "k", TenantID: 1, Content: "text"}})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	var count int64
+	require.NoError(t, db.Model(&types.Chunk{}).Distinct("seq_id").Count(&count).Error)
+	require.EqualValues(t, 12, count)
+}
 
 // setupChunkTestDB creates an in-memory SQLite database with chunk and tag tables.
 func setupChunkTestDB(t *testing.T) *gorm.DB {

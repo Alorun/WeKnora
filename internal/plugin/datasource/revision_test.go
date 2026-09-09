@@ -80,7 +80,11 @@ func (s *revisionKnowledgeService) CreateKnowledgeFromURL(
 	return s.newKnowledge(ctx, kbID, fileName, rawURL, nil)
 }
 func (s *revisionKnowledgeService) GetRepository() interfaces.KnowledgeRepository { return s.repo }
-func (s *revisionKnowledgeService) DeleteKnowledge(_ context.Context, id string) error {
+func (s *revisionKnowledgeService) DeleteKnowledge(ctx context.Context, id string) error {
+	tenant, ok := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	if !ok || tenant.ID != 7 || ctx.Value(types.TenantIDContextKey) != uint64(7) {
+		return errors.New("deletion requires trusted tenant context")
+	}
 	return s.repo.db.Delete(&types.Knowledge{}, "id = ?", id).Error
 }
 func (s *revisionKnowledgeService) BuildDocumentProcessTask(_ context.Context, knowledgeID string) (*asynq.Task, []asynq.Option, error) {
@@ -121,12 +125,17 @@ func revisionFixture(t *testing.T) (*gorm.DB, *pluginstore.Store, *RevisionProce
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&types.Knowledge{}, &control.DataSourceRevision{}))
+	require.NoError(t, db.AutoMigrate(&types.DataSource{}, &types.Knowledge{}, &control.DataSourceRevision{}))
+	require.NoError(t, db.Create(externalDS()).Error)
 	store := pluginstore.New(db)
 	repo := &revisionKnowledgeRepo{db: db}
 	knowledge := &revisionKnowledgeService{repo: repo}
 	queue := &revisionTaskRecorder{seen: make(map[string]struct{})}
-	return db, store, NewRevisionProcessor(store, knowledge, queue), queue
+	processor := NewRevisionProcessor(store, knowledge, queue)
+	processor.SetTenantLoader(func(_ context.Context, id uint64) (*types.Tenant, error) {
+		return &types.Tenant{ID: id}, nil
+	})
+	return db, store, processor, queue
 }
 
 func externalDS() *types.DataSource {
@@ -135,6 +144,36 @@ func externalDS() *types.DataSource {
 
 func externalItem(revision, body string) types.FetchedItem {
 	return types.FetchedItem{ExternalID: "a.md", Revision: revision, Title: "A", FileName: "a.md", Content: []byte(body), ContentType: "text/markdown"}
+}
+
+func TestLatePendingCompletionCannotResurrectDeletedOrSupersededContent(t *testing.T) {
+	for _, mode := range []string{"delete-file", "replace-pending", "delete-source"} {
+		t.Run(mode, func(t *testing.T) {
+			db, st, p, _ := revisionFixture(t)
+			ctx := context.Background()
+			_, err := p.AcceptExternalItem(ctx, externalDS(), externalItem("r1", "one"), nil)
+			require.NoError(t, err)
+			r1, err := st.GetRevision(ctx, "ds-1", "a.md", "r1")
+			require.NoError(t, err)
+			switch mode {
+			case "delete-file":
+				_, err = p.AcceptExternalItem(ctx, externalDS(), types.FetchedItem{ExternalID: "a.md", IsDeleted: true}, nil)
+			case "replace-pending":
+				_, err = p.AcceptExternalItem(ctx, externalDS(), externalItem("r2", "two"), nil)
+			case "delete-source":
+				err = db.Delete(externalDS()).Error
+			}
+			require.NoError(t, err)
+			require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", *r1.KnowledgeID).Update("parse_status", types.ParseStatusCompleted).Error)
+			require.NoError(t, p.ReconcilePending(ctx, 10))
+			_, err = st.ActivateRevision(ctx, "ds-1", "a.md", "r1")
+			require.Error(t, err)
+			var k types.Knowledge
+			require.NoError(t, db.First(&k, "id = ?", *r1.KnowledgeID).Error)
+			require.Equal(t, "disabled", k.EnableStatus)
+			require.Equal(t, "pending", k.GetMetadata()["plugin_revision_state"])
+		})
+	}
 }
 
 func TestRevisionReplayAndFailedReplacementKeepOldActive(t *testing.T) {

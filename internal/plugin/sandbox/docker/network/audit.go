@@ -43,6 +43,7 @@ var (
 
 // Identity is Host-owned metadata associated with a cgroup ID.
 type Identity struct {
+	InstanceID   string `json:"instance_id,omitempty"`
 	DeploymentID string `json:"deployment_id,omitempty"`
 	RunID        string `json:"prototype_run_id"`
 	PluginID     string `json:"plugin_id"`

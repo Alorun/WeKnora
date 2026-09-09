@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/middleware/asynqdl"
+	"github.com/Tencent/WeKnora/internal/plugin/controller"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -23,6 +25,8 @@ import (
 
 type AsynqTaskParams struct {
 	dig.In
+	PluginController *controller.Controller     `optional:"true"`
+	ResourceCleaner  interfaces.ResourceCleaner `optional:"true"`
 
 	// Dedicated servers provide minimum capacity for parse, post-process,
 	// enrichment, maintenance, and Wiki work. SharedServer is the elastic tier:
@@ -235,6 +239,9 @@ func NewPluginAsynqServer() *asynq.Server {
 func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	// Create a new mux and register all handlers
 	mux := asynq.NewServeMux()
+	if params.PluginController != nil {
+		mux.Use(params.PluginController.ObserveDocumentCompletion())
+	}
 
 	// Install the dead-letter middleware FIRST so it sees the raw error
 	// returned by the handler, before any other middleware that might
@@ -339,7 +346,22 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	runPool("maintenance-pool", params.MaintenanceServer)
 	runPool("shared-pool", params.SharedServer)
 	runPool("wiki-pool", params.WikiServer)
-	runPool("plugin-controller", params.PluginServer)
+	if params.PluginController != nil {
+		if err := params.PluginController.StartWorker(params.PluginServer, mux); err != nil {
+			panic(fmt.Errorf("start plugin worker: %w", err))
+		}
+	}
+	if params.ResourceCleaner != nil {
+		params.ResourceCleaner.RegisterWithName("AsynqWorkers", func() error {
+			for _, server := range []*asynq.Server{params.CoreServer, params.PostProcessServer, params.EnrichmentServer, params.MaintenanceServer, params.SharedServer, params.WikiServer} {
+				server.Stop()
+			}
+			for _, server := range []*asynq.Server{params.CoreServer, params.PostProcessServer, params.EnrichmentServer, params.MaintenanceServer, params.SharedServer, params.WikiServer} {
+				server.Shutdown()
+			}
+			return nil
+		})
+	}
 	return mux
 }
 

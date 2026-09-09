@@ -355,7 +355,7 @@ func (b *Backend) stop(ctx context.Context, id string, grace time.Duration) erro
 // bounded ring, and delivery errors remain visible in the exit diagnostics.
 func (b *Backend) drainAudit(ctx context.Context, i pluginruntime.BackendInstance, policy *network.PinnedPolicy) error {
 	generation, _ := strconv.ParseUint(i.Metadata["generation"], 10, 64)
-	identity := network.Identity{DeploymentID: b.config.DeploymentID, PluginID: i.Metadata["plugin_id"], DataSourceID: i.Metadata["data_source_id"], Generation: generation}
+	identity := network.Identity{InstanceID: i.ID, DeploymentID: b.config.DeploymentID, PluginID: i.Metadata["plugin_id"], DataSourceID: i.Metadata["data_source_id"], Generation: generation}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err

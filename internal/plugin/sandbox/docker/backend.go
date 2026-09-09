@@ -263,7 +263,7 @@ func (b *Backend) consume(ctx context.Context, i pluginruntime.BackendInstance, 
 	defer close(svc.done)
 	close(ready)
 	generation, _ := strconv.ParseUint(i.Metadata["generation"], 10, 64)
-	identity := network.Identity{DeploymentID: b.config.DeploymentID, PluginID: i.Metadata["plugin_id"], DataSourceID: i.Metadata["data_source_id"], Generation: generation}
+	identity := network.Identity{InstanceID: i.ID, DeploymentID: b.config.DeploymentID, PluginID: i.Metadata["plugin_id"], DataSourceID: i.Metadata["data_source_id"], Generation: generation}
 	for {
 		if ctx.Err() != nil {
 			return
