@@ -61,7 +61,17 @@ type AgentEngine struct {
 	// changed, so there is no reason to spend another summarization call.
 	compactionExhaustedAt int
 	modelContext          *modelcontext.Registry // single request-local boundary for every model handle
+	// steerSink, when set, lets users append messages into the running turn.
+	// Drained at every round boundary; nil disables mid-run injection.
+	steerSink         types.SteerSink
+	allowSteerOverrun bool // one extra ReAct round after a loop-end inject past MaxIterations
+	steerOverruns     int  // how many times this turn has already used the extra round
 }
+
+// maxSteerOverruns caps loop-end injects past MaxIterations. One extra round
+// lets a last-moment nudge revise the answer; further injects stay queued for
+// a follow-up turn instead of stretching the same run indefinitely.
+const maxSteerOverruns = 1
 
 // ImageDescriberFunc generates a text description of an image.
 // Signature matches vlm.VLM.Predict so it can be injected without importing the vlm package.
@@ -117,14 +127,26 @@ func (e *AgentEngine) SetPinnedMentions(mcpServices []*PinnedMCPServiceInfo, ski
 
 func (e *AgentEngine) systemPromptOptions(ctx context.Context) *BuildSystemPromptOptions {
 	opts := &BuildSystemPromptOptions{
-		Language: types.LanguageNameFromContext(ctx),
-		Config:   e.appConfig,
+		Language:         types.LanguageNameFromContext(ctx),
+		Config:           e.appConfig,
+		SkillInstallMode: e.config.SkillInstallMode(),
+		MemoryPrompt:     e.memoryPrompt,
+		ProtocolPrompt:   e.modelContext.ProtocolPrompt(),
 	}
 	if e.skillsManager != nil && e.skillsManager.IsEnabled() {
 		opts.SkillsMetadata = e.skillsManager.GetAllMetadata()
 	}
 	if e.toolRegistry != nil {
 		opts.SelectedTools = e.toolRegistry.ListTools()
+		if _, err := e.toolRegistry.GetTool("local_browser"); err == nil {
+			metadata := make([]*skills.SkillMetadata, 0, len(opts.SkillsMetadata))
+			for _, item := range opts.SkillsMetadata {
+				if item != nil && item.Name != "browser" && item.Name != "browser-skill" {
+					metadata = append(metadata, item)
+				}
+			}
+			opts.SkillsMetadata = metadata
+		}
 		_, err := e.toolRegistry.GetTool(agenttools.ToolShellExec)
 		opts.ShellExecEnabled = err == nil
 	}
@@ -132,16 +154,16 @@ func (e *AgentEngine) systemPromptOptions(ctx context.Context) *BuildSystemPromp
 }
 
 func (e *AgentEngine) buildSystemPrompt(ctx context.Context) string {
-	prompt := BuildSystemPromptWithOptions(
+	sections := BuildSystemPromptSections(
 		e.knowledgeBasesInfo,
 		e.config.WebSearchEnabled,
 		e.systemPromptOptions(ctx),
 		e.systemPromptTemplate,
 	)
-	// Memory has to ride in the system prompt: buildMessagesWithLLMContext
-	// drops system messages coming from history, so a separate memory message
-	// would be silently discarded from the second turn onward.
-	return strings.TrimRight(prompt, " \t\r\n") + e.memoryPrompt + e.modelContext.ProtocolPrompt()
+	for _, section := range sections {
+		logger.Debugf(ctx, "[Agent][Prompt] section=%s bytes=%d", section.Name, len(section.Content))
+	}
+	return renderSystemPromptSections(sections)
 }
 
 // SetMemoryPrompt supplies the long-term memory envelope for this run. Empty
@@ -417,6 +439,24 @@ func (e *AgentEngine) withinIterationBudget(round int) bool {
 	return round < e.config.MaxIterations
 }
 
+// closeAnswerStream emits the Done:true marker for a natural-stop answer
+// that is actually finishing. Loop-end inject skips this so the client
+// does not drop isReplying while the engine continues.
+func (e *AgentEngine) closeAnswerStream(ctx context.Context, sessionID, answerID string) {
+	if e.eventBus == nil || answerID == "" {
+		return
+	}
+	_ = e.eventBus.Emit(ctx, event.Event{
+		ID:        answerID,
+		Type:      event.EventAgentFinalAnswer,
+		SessionID: sessionID,
+		Data: event.AgentFinalAnswerData{
+			Content: "",
+			Done:    true,
+		},
+	})
+}
+
 func (e *AgentEngine) maxIterationsDisplay() string {
 	if e.config != nil && e.config.UnlimitedIterations() {
 		return "unlimited"
@@ -465,7 +505,8 @@ func (e *AgentEngine) executeLoop(
 	consecutiveSameContent := 0
 	lastResponseContent := ""
 loop:
-	for e.withinIterationBudget(state.CurrentRound) {
+	for e.withinIterationBudget(state.CurrentRound) || e.allowSteerOverrun {
+		e.allowSteerOverrun = false
 		// Check for context cancellation (request timeout, user cancel, etc.)
 		select {
 		case <-ctx.Done():
@@ -475,7 +516,7 @@ loop:
 			if totalTC := countTotalToolCalls(state.RoundSteps); totalTC > 0 {
 				logger.Infof(ctx, "[Agent] Synthesizing final answer from %d existing tool results",
 					totalTC)
-				_ = e.streamFinalAnswerToEventBus(ctx, query, state, sessionID)
+				_ = e.streamFinalAnswerToEventBus(ctx, query, state, sessionID, messages)
 				state.IsComplete = true
 			}
 			return state, ctx.Err()
@@ -516,7 +557,7 @@ loop:
 	// complete answer." message, which then leaks to the UI as the final
 	// answer for a conversation the user deliberately stopped.
 	if !state.IsComplete && ctx.Err() == nil {
-		e.handleMaxIterations(ctx, query, state, sessionID)
+		e.handleMaxIterations(ctx, query, state, sessionID, messages)
 	}
 
 	return state, nil
@@ -616,6 +657,13 @@ func (e *AgentEngine) runReActIteration(
 		currentTokens = e.tokenEstimator.EstimateMessages(managed)
 	}
 
+	// Mid-run steering: drain any user messages queued while the previous
+	// round was thinking/executing tools. Runs after compression (injected
+	// text stays inside the protected tail) and before lastSentMsgCount is
+	// updated (the injected text counts as new delta tokens for the next
+	// call), so the very next LLM call sees the user's addition.
+	e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID)
+
 	logger.Infof(ctx, "[Agent][Round-%d/%s] Starting: %d messages, %d tools, est_tokens=%d",
 		round, e.maxIterationsDisplay(), len(*messagesPtr), len(tools), currentTokens)
 	e.logContextPrediction(ctx, round, *messagesPtr, tools, currentTokens)
@@ -695,12 +743,14 @@ func (e *AgentEngine) runReActIteration(
 
 	// Create agent step
 	step := types.AgentStep{
-		Iteration:        state.CurrentRound,
-		Thought:          response.Content,
-		ReasoningContent: response.ReasoningContent,
-		ToolCalls:        make([]types.ToolCall, 0),
-		Timestamp:        time.Now(),
+		UserMessagesBefore: state.PendingSteerMessages,
+		Iteration:          state.CurrentRound,
+		Thought:            response.Content,
+		ReasoningContent:   response.ReasoningContent,
+		ToolCalls:          make([]types.ToolCall, 0),
+		Timestamp:          time.Now(),
 	}
+	state.PendingSteerMessages = nil
 
 	// If the request was cancelled while the LLM was streaming (e.g. the
 	// user pressed "stop"), the stream driver still returns a usable
@@ -715,7 +765,7 @@ func (e *AgentEngine) runReActIteration(
 	if ctx.Err() != nil {
 		logger.Warnf(ctx, "[Agent][Round-%d] Context cancelled during LLM call; preserving partial step",
 			round)
-		if step.Thought != "" || len(step.ToolCalls) > 0 {
+		if step.Thought != "" || len(step.ToolCalls) > 0 || len(step.UserMessagesBefore) > 0 {
 			state.RoundSteps = append(state.RoundSteps, step)
 		}
 		return iterOutcomeBreak, nil
@@ -730,6 +780,7 @@ func (e *AgentEngine) runReActIteration(
 		if verdict.emptyContent {
 			*emptyRetries++
 			if *emptyRetries <= maxEmptyResponseRetries {
+				state.PendingSteerMessages = step.UserMessagesBefore
 				logger.Warnf(ctx, "[Agent][Round-%d] Empty content with stop - retrying (%d/%d)",
 					round, *emptyRetries, maxEmptyResponseRetries)
 				*messagesPtr = append(*messagesPtr, chat.Message{
@@ -744,11 +795,39 @@ func (e *AgentEngine) runReActIteration(
 			state.FinalAnswer = "I'm sorry, I was unable to generate a response. Please try again."
 			state.IsComplete = true
 			state.RoundSteps = append(state.RoundSteps, verdict.step)
+			e.closeAnswerStream(ctx, sessionID, verdict.answerID)
 			return iterOutcomeBreak, nil
+		}
+		// Loop-end inject: a user message queued while this finishing round
+		// ran should keep the agent going instead of emitting a final answer.
+		// Content-filter stops are terminal and do not take this path.
+		// Past MaxIterations only the first inject gets an extra round;
+		// anything after that stays in the queue for a follow-up turn.
+		if response.FinishReason != "content_filter" {
+			nextRound := state.CurrentRound + 1
+			canContinue := e.withinIterationBudget(nextRound) || e.steerOverruns < maxSteerOverruns
+			if canContinue {
+				*messagesPtr = append(*messagesPtr, chat.Message{
+					Role:             "assistant",
+					Content:          verdict.finalAnswer,
+					ReasoningContent: response.ReasoningContent,
+				})
+				injected := e.drainSteerMessages(ctx, state, messagesPtr, sessionID, assistantMessageID)
+				if injected > 0 {
+					verdict.step.IntermediateAnswer = true
+					state.RoundSteps = append(state.RoundSteps, verdict.step)
+					if !e.withinIterationBudget(nextRound) {
+						e.steerOverruns++
+						e.allowSteerOverrun = true
+					}
+					return iterOutcomeNext, nil
+				}
+			}
 		}
 		state.FinalAnswer = verdict.finalAnswer
 		state.IsComplete = true
 		state.RoundSteps = append(state.RoundSteps, verdict.step)
+		e.closeAnswerStream(ctx, sessionID, verdict.answerID)
 		return iterOutcomeBreak, nil
 	}
 
@@ -770,6 +849,7 @@ func (e *AgentEngine) runReActIteration(
 	// 4. Observe: Add tool results to messages and write to context
 	state.RoundSteps = append(state.RoundSteps, step)
 	*messagesPtr = e.appendToolResults(*messagesPtr, step)
+	*messagesPtr = e.appendToolImages(ctx, *messagesPtr, step)
 	common.PipelineInfo(ctx, "Agent", "round_end", map[string]interface{}{
 		"iteration":   state.CurrentRound,
 		"round":       round,
@@ -826,7 +906,9 @@ func (e *AgentEngine) describeImages(ctx context.Context, imageDataURIs []string
 			logger.Warnf(ctx, "[Agent] VLM analysis failed for tool result image %d: %v", i, err)
 			continue
 		}
-		descriptions = append(descriptions, strings.TrimSpace(desc))
+		if desc = strings.TrimSpace(desc); desc != "" {
+			descriptions = append(descriptions, desc)
+		}
 	}
 	return descriptions
 }

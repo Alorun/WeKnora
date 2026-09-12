@@ -9,8 +9,8 @@ import (
 
 func TestPostgreSQLAndSQLitePluginMigrationStructuresMatch(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", "..", ".."))
-	postgres := readMigration(t, filepath.Join(root, "migrations", "versioned", "000093_plugin_control_plane.up.sql"))
-	sqlite := readMigration(t, filepath.Join(root, "migrations", "sqlite", "000014_plugin_control_plane.up.sql"))
+	postgres := readMigration(t, filepath.Join(root, "migrations", "versioned", "000094_plugin_control_plane.up.sql"))
+	sqlite := readMigration(t, filepath.Join(root, "migrations", "sqlite", "000015_plugin_control_plane.up.sql"))
 
 	tables := map[string][]string{
 		"plugin_installations": {
