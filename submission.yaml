@@ -1,0 +1,15 @@
+version: 1
+student:
+  name: "郑成龙"
+  github_id: "Alorun"
+topic:
+  id: "1"
+  title: "扩展能力插件化框架"
+result:
+  type: code
+  url: "https://github.com/Alorun/WeKnora/tree/rhino-2026-final-1"
+repository:
+  url: "https://github.com/Alorun/WeKnora.git"
+  branch: "feat/framework-for-extending-capabilities"
+  commit: "e492d15d04c41d7982df7089aa8ef9b799ca5fed"
+  tag: "rhino-2026-final-1"
