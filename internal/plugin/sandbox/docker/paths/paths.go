@@ -56,7 +56,7 @@ func relEscapes(rel string) bool {
 	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel)
 }
 
-// GrantSnapshot is the temporary, in-memory Directory Grant used by this prototype.
+// GrantSnapshot captures the verified directory identity used to authorize a bind mount.
 type GrantSnapshot struct {
 	CanonicalPath string `json:"canonical_path"`
 	Device        uint64 `json:"device"`

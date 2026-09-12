@@ -4,6 +4,10 @@
 
 数据源在知识库中配置。打开目标知识库的编辑设置，进入「数据源」页签，新建连接并填写凭据，然后选择同步范围与周期。首次同步获取完整内容，后续同步根据连接器能力增量更新。
 
+管理员也可以从预置目录加载 V1 外部 DataSource 插件。外部插件经本机 Docker、
+UDS、只读目录授权和禁网审计运行，目前通过受鉴权 API 配置；开发与部署见
+[外部 DataSource 插件](../06-development/04-datasource-plugins.md)。
+
 <Screenshot
   src="/screenshots/datasource-sync.png"
   caption="数据源：连接列表与同步状态"

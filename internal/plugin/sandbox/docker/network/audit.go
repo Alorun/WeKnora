@@ -45,7 +45,6 @@ var (
 type Identity struct {
 	InstanceID   string `json:"instance_id,omitempty"`
 	DeploymentID string `json:"deployment_id,omitempty"`
-	RunID        string `json:"prototype_run_id"`
 	PluginID     string `json:"plugin_id"`
 	DataSourceID string `json:"data_source_id"`
 	Generation   uint64 `json:"generation"`
@@ -307,7 +306,7 @@ func (p *PinnedPolicy) Detach() error {
 		errs = append(errs, err)
 	}
 	parent := filepath.Dir(p.pinRoot)
-	if parent == "/sys/fs/bpf/weknora-plugin-prototype" {
+	if parent == "/sys/fs/bpf/weknora-plugin-network-integration" {
 		if err := os.Remove(parent); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {
 			errs = append(errs, err)
 		}

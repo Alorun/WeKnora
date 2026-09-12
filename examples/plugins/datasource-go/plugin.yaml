@@ -1,0 +1,29 @@
+apiVersion: plugins.weknora.io/v1alpha1
+kind: Plugin
+metadata:
+  id: example.hello
+  name: Hello DataSource
+  version: 0.1.0
+spec:
+  protocolVersion: "1.0"
+  compatibility:
+    weknora: ">=0.8.0 <0.9.0"
+  extension:
+    id: hello
+    type: datasource
+    contractVersion: "1.0"
+    capabilities: [resource_listing, full_sync, incremental_sync]
+  runtime:
+    kind: sandbox_service
+    transport: uds
+    entrypoint: bin/plugin-linux-amd64
+  permissions:
+    network: none
+    filesystem: selected_directory_readonly
+  resources:
+    memoryMiB: 256
+    cpuQuota: 0.5
+    maxProcesses: 32
+  configSchema:
+    type: object
+    additionalProperties: false

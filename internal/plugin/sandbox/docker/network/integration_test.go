@@ -18,15 +18,15 @@ func TestCgroupDenyAudit(t *testing.T) {
 	if os.Getenv("WEKNORA_EBPF_INTEGRATION") != "1" {
 		t.Skip("set WEKNORA_EBPF_INTEGRATION=1 inside the controlled helper container")
 	}
-	runID := os.Getenv("WEKNORA_PROTOTYPE_RUN_ID")
+	runID := os.Getenv("WEKNORA_EBPF_RUN_ID")
 	if runID == "" {
-		t.Fatal("WEKNORA_PROTOTYPE_RUN_ID is required")
+		t.Fatal("WEKNORA_EBPF_RUN_ID is required")
 	}
 	cgroupPath, err := currentCgroupPath("/sys/fs/cgroup")
 	if err != nil {
 		t.Fatal(err)
 	}
-	pinRoot := filepath.Join("/sys/fs/bpf/weknora-plugin-prototype", runID+"-network-test")
+	pinRoot := filepath.Join("/sys/fs/bpf/weknora-plugin-network-integration", runID+"-network-test")
 	policy, err := AttachAndPin(cgroupPath, pinRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -50,14 +50,14 @@ func TestCgroupDenyAudit(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	events, err := policy.ReadEvents(ctx, 4, Identity{RunID: runID, PluginID: "network-test", DataSourceID: "network-test", Generation: 1})
+	events, err := policy.ReadEvents(ctx, 4, Identity{InstanceID: runID, PluginID: "network-test", DataSourceID: "network-test", Generation: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := map[string]bool{"ipv4/tcp/connect4": false, "ipv6/tcp/connect6": false, "ipv4/udp/sendmsg4": false, "ipv6/udp/sendmsg6": false}
 	for _, event := range events {
 		want[event.Family+"/"+event.Protocol+"/"+event.Hook] = true
-		if event.Identity.RunID != runID {
+		if event.Identity.InstanceID != runID {
 			t.Errorf("event identity mismatch: %+v", event.Identity)
 		}
 	}
@@ -105,7 +105,7 @@ func udpAttempt(network, target string) string {
 		return err.Error()
 	}
 	defer connection.Close()
-	if _, err = connection.WriteToUDP([]byte("weknora-prototype"), address); err != nil {
+	if _, err = connection.WriteToUDP([]byte("weknora-network-test"), address); err != nil {
 		return err.Error()
 	}
 	return fmt.Sprintf("unexpected success to %s", target)

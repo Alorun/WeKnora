@@ -2,6 +2,11 @@
 
 WeKnora 的解析器、分块策略、检索引擎、模型 Provider、搜索引擎、数据源、IM 适配器、Agent 工具和存储后端均通过接口接入。新增实现时，先实现对应接口，再在注册入口装配，并验证现有调用链。以下按扩展类型列出接口、已有实现和接入步骤。
 
+其中 DataSource、文档解析器、WebSearch、ModelProvider 和 RetrievalEngine 五类
+内置扩展由 Catalog、PluginManager 和类型化 Registrar 统一发布、停止及健康检查；
+`container.go` 负责依赖装配，不再是绕过 Manager 的直接注册入口。第三方进程外
+插件 V1 仅开放 DataSource，开发与安全部署见[外部 DataSource 插件](04-datasource-plugins.md)。
+
 ## 扩展点总览 {#_0-扩展点总览}
 
 ```mermaid
