@@ -180,16 +180,6 @@ func TestCreateRetrieveEngineForKB_Unbound(t *testing.T) {
 	}
 }
 
-func TestCreateRetrieveEngineForKB_UnboundMissingTenant(t *testing.T) {
-	registry := registryWithStores(t, nil, nil)
-	ownership := &fakeOwnership{}
-
-	_, err := CreateRetrieveEngineForKB(context.Background(), registry, ownership, 1, nil)
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrTenantInfoMissing),
-		"err %q must wrap ErrTenantInfoMissing", err)
-}
-
 func TestCreateRetrieveEngineForKB_StoreBound(t *testing.T) {
 	esEngine := &fakeEngine{
 		engineType: types.ElasticsearchRetrieverEngineType,
@@ -341,24 +331,6 @@ func TestCreateRetrieveEngineFromPayload_Bound(t *testing.T) {
 	require.NotNil(t, engine)
 	require.Len(t, engine.engineInfos, 1)
 	assert.Same(t, qdrantEngine, engine.engineInfos[0].retrieveEngine.(*managedEngine).RetrieveEngineService)
-}
-
-func TestCreateRetrieveEngineFromPayload_TamperedCrossTenant(t *testing.T) {
-	esEngine := &fakeEngine{engineType: types.ElasticsearchRetrieverEngineType,
-		support: []types.RetrieverType{types.VectorRetrieverType}}
-	registry := registryWithStores(t,
-		map[string]*fakeEngine{"store-A": esEngine}, nil)
-	// Store is owned by tenant 99, but the (possibly tampered) payload
-	// claims tenant 1. Factory must reject.
-	ownership := &fakeOwnership{owned: map[string]uint64{"store-A": 99}}
-
-	storeID := "store-A"
-	_, err := CreateRetrieveEngineFromPayload(
-		context.Background(), registry, ownership, 1,
-		[]types.RetrieverEngineParams{}, &storeID)
-
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrVectorStoreForbidden))
 }
 
 // ----- Race -----

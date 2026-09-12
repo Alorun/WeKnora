@@ -131,14 +131,15 @@ type Runtime interface {
 }
 
 type PluginSandboxRuntime struct {
-	backend      PluginSandboxBackend
-	resolver     *plugindatasource.Resolver
-	dialTimeout  time.Duration
-	readyTimeout time.Duration
+	backend       PluginSandboxBackend
+	resolver      *plugindatasource.Resolver
+	dialTimeout   time.Duration
+	readyTimeout  time.Duration
+	healthTimeout time.Duration
 }
 
 func New(backend PluginSandboxBackend, resolver *plugindatasource.Resolver) *PluginSandboxRuntime {
-	return &PluginSandboxRuntime{backend: backend, resolver: resolver, dialTimeout: 5 * time.Second, readyTimeout: 15 * time.Second}
+	return &PluginSandboxRuntime{backend: backend, resolver: resolver, dialTimeout: 5 * time.Second, readyTimeout: 15 * time.Second, healthTimeout: 5 * time.Second}
 }
 
 type handle struct {
@@ -264,7 +265,13 @@ func (r *PluginSandboxRuntime) Health(ctx context.Context, runtimeHandle Runtime
 	if runtimeHandle == nil {
 		return HealthResult{}, fmt.Errorf("runtime handle is required")
 	}
-	resp, err := runtimeHandle.ControlClient().Health(ctx, &pluginv1.HealthRequest{})
+	timeout := r.healthTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	healthCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	resp, err := runtimeHandle.ControlClient().Health(healthCtx, &pluginv1.HealthRequest{})
 	if err != nil {
 		return HealthResult{}, err
 	}

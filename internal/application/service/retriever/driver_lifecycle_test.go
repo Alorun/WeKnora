@@ -40,7 +40,7 @@ func TestDriverStopDrainsAndRejectsRetainedService(t *testing.T) {
 	go func() { _, err := svc.Retrieve(context.Background(), types.RetrieveParams{}); callDone <- err }()
 	<-e.entered
 	stopped := make(chan error, 1)
-	go func() { stopped <- r.UnpublishDriver(e.EngineType()) }()
+	go func() { stopped <- r.UnpublishDriver(context.Background(), e.EngineType()) }()
 	require.Eventually(t, func() bool { return !r.IsDriverPublished(e.EngineType()) }, time.Second, time.Millisecond)
 	select {
 	case <-stopped:
@@ -72,4 +72,30 @@ func TestDriverStopDrainsAndRejectsRetainedService(t *testing.T) {
 	_, err = fresh.Retrieve(ctx, types.RetrieveParams{})
 	require.NoError(t, err)
 	require.EqualValues(t, 2, e.calls.Load(), "only the admitted old call and fresh epoch call reach the driver")
+}
+
+func TestDriverStopTimeoutCanBeRetriedAfterInflightCallCompletes(t *testing.T) {
+	r := NewRetrieveEngineRegistry(nil, nil).(*RetrieveEngineRegistry)
+	e := &blockingEngine{mockEngineService: mockEngineService{engineType: types.PostgresRetrieverEngineType}, entered: make(chan struct{}, 1), finish: make(chan struct{})}
+	require.NoError(t, r.Declare(e))
+	require.NoError(t, r.PublishDriver(e.EngineType()))
+	svc, err := r.GetRetrieveEngineService(e.EngineType())
+	require.NoError(t, err)
+	callDone := make(chan error, 1)
+	go func() { _, err := svc.Retrieve(context.Background(), types.RetrieveParams{}); callDone <- err }()
+	<-e.entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err = r.UnpublishDriver(ctx, e.EngineType())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.False(t, r.IsDriverPublished(e.EngineType()))
+	_, err = svc.Retrieve(context.Background(), types.RetrieveParams{})
+	require.ErrorIs(t, err, ErrDriverNotActive)
+	require.Error(t, r.PublishDriver(e.EngineType()), "a draining epoch must not be replaced")
+
+	close(e.finish)
+	require.NoError(t, <-callDone)
+	require.NoError(t, r.UnpublishDriver(context.Background(), e.EngineType()))
+	require.NoError(t, r.PublishDriver(e.EngineType()))
 }

@@ -221,7 +221,7 @@ func (r *ModelRegistrar) Health(context.Context) error {
 type RetrievalRegistry interface {
 	SupportsDriver(types.RetrieverEngineType) bool
 	PublishDriver(types.RetrieverEngineType) error
-	UnpublishDriver(types.RetrieverEngineType) error
+	UnpublishDriver(context.Context, types.RetrieverEngineType) error
 	IsDriverPublished(types.RetrieverEngineType) bool
 }
 
@@ -241,8 +241,8 @@ func (r *RetrievalRegistrar) Publish(context.Context) error {
 	return r.Registry.PublishDriver(r.EngineType)
 }
 
-func (r *RetrievalRegistrar) Unpublish(context.Context) error {
-	return r.Registry.UnpublishDriver(r.EngineType)
+func (r *RetrievalRegistrar) Unpublish(ctx context.Context) error {
+	return r.Registry.UnpublishDriver(ctx, r.EngineType)
 }
 
 func (r *RetrievalRegistrar) Health(context.Context) error {

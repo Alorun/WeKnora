@@ -175,6 +175,9 @@ func managedFallbackReader(engine string, reader interfaces.DocReader) interface
 	if reader == nil {
 		return nil
 	}
+	if managed, ok := reader.(*activeEngineReader); ok && managed.engine == engine {
+		return reader
+	}
 	return &activeEngineReader{engine: engine, inner: reader}
 }
 

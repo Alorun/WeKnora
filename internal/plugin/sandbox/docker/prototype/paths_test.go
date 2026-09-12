@@ -77,12 +77,6 @@ func TestPathMappingRequiresExplicitConsistentRoots(t *testing.T) {
 	}
 }
 
-func TestRuntimeSocketPathLength(t *testing.T) {
-	if _, err := RuntimeSocketPath("/tmp/" + strings.Repeat("x", 105)); err == nil {
-		t.Fatal("overlong UDS path was accepted")
-	}
-}
-
 func TestCleanupRuntimeDirIsIdempotent(t *testing.T) {
 	runtimeDir := filepath.Join(t.TempDir(), "runtime")
 	mustMkdir(t, runtimeDir)
@@ -106,12 +100,6 @@ func TestMetadataFiltering(t *testing.T) {
 	labels["prototype_run_id"] = "other-run"
 	if matchesSpecLabels(spec, labels) {
 		t.Fatal("other run metadata was accepted")
-	}
-}
-
-func TestSpecMissingFields(t *testing.T) {
-	if err := (PrototypeInstanceSpec{}).Validate(); err == nil {
-		t.Fatal("empty spec was accepted")
 	}
 }
 

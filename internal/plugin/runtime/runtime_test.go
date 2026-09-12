@@ -14,6 +14,8 @@ import (
 	pluginsdk "github.com/Tencent/WeKnora/pkg/plugin/sdk"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type runtimeDataSource struct {
@@ -127,6 +129,31 @@ func TestRuntimeFailureCleansBackendWithoutPublishing(t *testing.T) {
 	require.ErrorIs(t, resolveErr, plugindatasource.ErrHandleNotFound)
 	require.Equal(t, 1, backend.started)
 	require.Equal(t, 1, backend.stopped)
+}
+
+func TestRuntimeHealthIsBoundedAndRespectsShorterCallerDeadline(t *testing.T) {
+	resolver := plugindatasource.NewResolver()
+	backend := &fakeBackend{root: t.TempDir(), healthStatus: pluginv1.HealthStatus_HEALTH_STATUS_READY}
+	block := make(chan struct{})
+	var healthCalls atomic.Int32
+	backend.healthHook = func() {
+		if healthCalls.Add(1) > 1 {
+			<-block
+		}
+	}
+	runtime := New(backend, resolver)
+	handle, err := runtime.Start(context.Background(), runtimeSpec(backend.root))
+	require.NoError(t, err)
+	defer runtime.Stop(context.Background(), handle, 0)
+	defer close(block)
+
+	runtime.healthTimeout = time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err = runtime.Health(ctx, handle)
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	require.Less(t, time.Since(started), 500*time.Millisecond)
 }
 
 func TestRuntimeOldConnectionCannotReconnectToReplacement(t *testing.T) {

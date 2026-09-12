@@ -64,6 +64,21 @@ func New(cfg *config.Config, cat *catalog.Catalog, mgr *manager.PluginManager, s
 	return &Controller{Config: cfg.ExternalPlugins, Catalog: cat, Manager: mgr, Store: st, db: db, dsRepo: ds, audit: audit, revisions: revisions, scheduler: scheduler, routes: routes, syncs: map[string]context.CancelFunc{}}
 }
 
+func discoveredPackageLoader(packages map[string]prepare.Package) func(context.Context, control.PluginInstallation) (prepare.Package, error) {
+	return func(_ context.Context, installation control.PluginInstallation) (prepare.Package, error) {
+		pkg, ok := packages[installation.ID]
+		if !ok {
+			return prepare.Package{}, errors.New("installation package unavailable")
+		}
+		if pkg.Manifest.Metadata.ID != installation.PluginID ||
+			pkg.Manifest.Metadata.Version != installation.Version ||
+			pkg.Artifact.Digest != installation.ArtifactDigest {
+			return prepare.Package{}, errors.New("discovered package identity does not match installation")
+		}
+		return pkg.Clone(), nil
+	}
+}
+
 func (c *Controller) Start(ctx context.Context, version string) (result error) {
 	if !c.Config.Enabled {
 		return nil
@@ -121,6 +136,7 @@ func (c *Controller) Start(ctx context.Context, version string) (result error) {
 	if err != nil {
 		return err
 	}
+	packages := make(map[string]prepare.Package, len(results))
 	for _, found := range results {
 		row := found.Installation
 		if found.Package != nil {
@@ -167,23 +183,16 @@ func (c *Controller) Start(ctx context.Context, version string) (result error) {
 			if err := c.Manager.LoadExternal(found.Package.Manifest); err != nil {
 				return err
 			}
+			packages[row.ID] = found.Package.Clone()
 		}
 	}
 	c.Builder = prepare.Builder{Grants: prepare.GrantService{Store: c.Store, AllowRoots: cfg.AllowRoots, AdminUID: cfg.AdminUID, PluginUID: cfg.PluginUID}, LoadDataSource: c.dsRepo.FindByID,
-		LoadPackage: func(ctx context.Context, i control.PluginInstallation) (prepare.Package, error) {
-			// Load the immutable administrator snapshot, never a mutated package.
-			for _, found := range results {
-				if found.Package != nil && found.Installation.PluginID == i.PluginID {
-					return c.discovery.Load(found.Path)
-				}
-			}
-			return prepare.Package{}, errors.New("installation package unavailable")
-		}, RuntimeRoot: cfg.RuntimeRoot, MaxResources: limits}
+		LoadPackage: discoveredPackageLoader(packages), RuntimeRoot: cfg.RuntimeRoot, MaxResources: limits}
 	runtime := pr.New(b, c.routes)
 	if err := c.Manager.ConfigureRuntime(runtime); err != nil {
 		return err
 	}
-	c.reconciler = reconcile.New(c.Store, c.Manager, runtime, b, c.routes, c.Builder, c.revisions)
+	c.reconciler = reconcile.New(c.Store, c.Manager, runtime, b, c.routes, c.Builder, c.revisions, c.cancelSyncForInstance)
 	if err := c.reconciler.ReconcileOnce(ctx); err != nil {
 		logger.Warnf(ctx, "[PluginController] initial instance recovery: %v", err)
 	}

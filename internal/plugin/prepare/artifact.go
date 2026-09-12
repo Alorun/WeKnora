@@ -30,6 +30,13 @@ type Package struct {
 	Artifact pluginruntime.ArtifactReference
 }
 
+// Clone keeps the discovered snapshot immutable to callers. ArtifactReference
+// contains only value fields; Manifest owns the mutable slices and schema map.
+func (p Package) Clone() Package {
+	p.Manifest = p.Manifest.Clone()
+	return p
+}
+
 type Discovery struct {
 	Packages            paths.PathMapping
 	Snapshots           paths.PathMapping

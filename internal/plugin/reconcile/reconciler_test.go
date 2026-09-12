@@ -35,10 +35,16 @@ type reconcileStore struct {
 	installation control.PluginInstallation
 	state        control.PluginState
 	sandboxID    string
+	lists        int
 }
 
 func (s *reconcileStore) ListBindings(context.Context) ([]control.DataSourcePluginBinding, error) {
+	s.lists++
 	return []control.DataSourcePluginBinding{s.binding}, nil
+}
+func (s *reconcileStore) GetBinding(context.Context, string) (*control.DataSourcePluginBinding, error) {
+	copy := s.binding
+	return &copy, nil
 }
 func (s *reconcileStore) GetInstallation(context.Context, string) (*control.PluginInstallation, error) {
 	copy := s.installation
@@ -75,9 +81,15 @@ func (c *reconcileController) StopExternal(_ context.Context, _ string, dataSour
 	return nil
 }
 
-type reconcileRuntime struct{ pluginruntime.Runtime }
+type reconcileRuntime struct {
+	pluginruntime.Runtime
+	health func(context.Context, pluginruntime.RuntimeHandle) (pluginruntime.HealthResult, error)
+}
 
-func (reconcileRuntime) Health(context.Context, pluginruntime.RuntimeHandle) (pluginruntime.HealthResult, error) {
+func (r reconcileRuntime) Health(ctx context.Context, handle pluginruntime.RuntimeHandle) (pluginruntime.HealthResult, error) {
+	if r.health != nil {
+		return r.health(ctx, handle)
+	}
 	return pluginruntime.HealthResult{Status: pluginv1.HealthStatus_HEALTH_STATUS_READY}, nil
 }
 
@@ -131,7 +143,7 @@ func TestPermanentFailureHasBoundedRetryAndGenerationResetsIt(t *testing.T) {
 		installation: control.PluginInstallation{ID: "install", Active: true, Enabled: true, InstallStatus: control.InstallStatusInstalled},
 	}
 	specs := &unavailableSpecs{}
-	r := New(st, &reconcileController{resolver: resolver}, reconcileRuntime{}, &reconcileBackend{}, resolver, specs, nil)
+	r := New(st, &reconcileController{resolver: resolver}, reconcileRuntime{}, &reconcileBackend{}, resolver, specs, nil, nil)
 	for n := 0; n < 6; n++ {
 		_ = r.ReconcileOnce(context.Background())
 		entry := r.retries["ds"]
@@ -158,7 +170,7 @@ func TestReconcilerReplacesOldGenerationAndCleansOrphan(t *testing.T) {
 	controller := &reconcileController{resolver: resolver}
 	backend := &reconcileBackend{instances: []pluginruntime.BackendInstance{{ID: "orphan", Metadata: map[string]string{"data_source_id": "orphan-ds"}}}}
 	revisions := &revisionRecorder{}
-	reconciler := New(store, controller, reconcileRuntime{}, backend, resolver, reconcileSpecs{}, revisions)
+	reconciler := New(store, controller, reconcileRuntime{}, backend, resolver, reconcileSpecs{}, revisions, nil)
 	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
 	require.Equal(t, 1, controller.stops)
 	require.Equal(t, 1, controller.starts)
@@ -179,12 +191,87 @@ func TestReconcilerInspectsAndSafelyRebuildsAfterControllerRestart(t *testing.T)
 	backend := &reconcileBackend{instances: []pluginruntime.BackendInstance{{
 		ID: "pre-restart", Metadata: map[string]string{"data_source_id": "ds-1", "generation": "1"},
 	}}}
-	reconciler := New(store, controller, reconcileRuntime{}, backend, resolver, reconcileSpecs{}, nil)
+	reconciler := New(store, controller, reconcileRuntime{}, backend, resolver, reconcileSpecs{}, nil, nil)
 	require.NoError(t, reconciler.ReconcileOnce(context.Background()))
-	require.Equal(t, []string{"pre-restart"}, backend.inspected)
+	require.Empty(t, backend.inspected, "Backend.Stop owns the authoritative inspect")
 	require.Contains(t, backend.stopped, "pre-restart")
 	require.Equal(t, 1, controller.starts)
 	require.Equal(t, "true", backend.filters["managed"])
 	require.Equal(t, "plugin", backend.filters["workload_kind"])
 	require.Equal(t, control.StateReady, store.state)
+}
+
+func TestRunWaitsForPeriodicTickAfterCallerInitialPass(t *testing.T) {
+	resolver := plugindatasource.NewResolver()
+	store := &reconcileStore{}
+	r := New(store, &reconcileController{resolver: resolver}, reconcileRuntime{}, &reconcileBackend{}, resolver, reconcileSpecs{}, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, r.Run(ctx, time.Hour), context.Canceled)
+	require.Zero(t, store.lists)
+}
+
+func TestManualAndPeriodicHealthShareCleanupWithoutSharingRetryBudget(t *testing.T) {
+	newFixture := func(cancelSync func(string, uint64, string)) (*Reconciler, *reconcileStore, *reconcileController) {
+		resolver := plugindatasource.NewResolver()
+		require.NoError(t, resolver.Publish("ds-1", 1, &reconcileHandle{id: "instance-1", dsID: "ds-1", generation: 1}))
+		store := &reconcileStore{
+			binding:      control.DataSourcePluginBinding{DataSourceID: "ds-1", InstallationID: "install-1", Generation: 1},
+			installation: control.PluginInstallation{ID: "install-1", Active: true, Enabled: true, InstallStatus: control.InstallStatusInstalled},
+		}
+		controller := &reconcileController{resolver: resolver}
+		runtime := reconcileRuntime{health: func(context.Context, pluginruntime.RuntimeHandle) (pluginruntime.HealthResult, error) {
+			return pluginruntime.HealthResult{Status: pluginv1.HealthStatus_HEALTH_STATUS_NOT_READY}, nil
+		}}
+		return New(store, controller, runtime, &reconcileBackend{}, resolver, reconcileSpecs{}, nil, cancelSync), store, controller
+	}
+
+	canceled := 0
+	manual, manualStore, manualController := newFixture(func(string, uint64, string) { canceled++ })
+	_, err := manual.Health(context.Background(), "ds-1")
+	require.ErrorContains(t, err, "not READY")
+	require.Equal(t, 1, canceled)
+	require.Equal(t, 1, manualController.stops)
+	require.Equal(t, control.StateNotReady, manualStore.state)
+	require.Empty(t, manual.retries, "manual health must not consume automatic retry budget")
+
+	periodic, periodicStore, periodicController := newFixture(func(string, uint64, string) { canceled++ })
+	err = periodic.ReconcileOnce(context.Background())
+	require.ErrorContains(t, err, "not READY")
+	require.Equal(t, 2, canceled)
+	require.Equal(t, 1, periodicController.stops)
+	require.Equal(t, control.StateNotReady, periodicStore.state)
+	require.Equal(t, 1, periodic.retries["ds-1"].attempts)
+}
+
+func TestLateHealthFailureCannotStopReplacementInstance(t *testing.T) {
+	resolver := plugindatasource.NewResolver()
+	old := &reconcileHandle{id: "old-instance", dsID: "ds-1", generation: 1}
+	require.NoError(t, resolver.Publish("ds-1", 1, old))
+	store := &reconcileStore{
+		binding:      control.DataSourcePluginBinding{DataSourceID: "ds-1", InstallationID: "install-1", Generation: 1},
+		installation: control.PluginInstallation{ID: "install-1", Active: true, Enabled: true, InstallStatus: control.InstallStatusInstalled},
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	runtime := reconcileRuntime{health: func(context.Context, pluginruntime.RuntimeHandle) (pluginruntime.HealthResult, error) {
+		close(entered)
+		<-release
+		return pluginruntime.HealthResult{}, errors.New("old instance unhealthy")
+	}}
+	controller := &reconcileController{resolver: resolver}
+	canceled := 0
+	r := New(store, controller, runtime, &reconcileBackend{}, resolver, reconcileSpecs{}, nil, func(string, uint64, string) { canceled++ })
+	done := make(chan error, 1)
+	go func() { _, err := r.Health(context.Background(), "ds-1"); done <- err }()
+	<-entered
+	_, err := resolver.UnpublishInstance("ds-1", 1, old.InstanceID())
+	require.NoError(t, err)
+	require.NoError(t, resolver.Publish("ds-1", 1, &reconcileHandle{id: "replacement", dsID: "ds-1", generation: 1}))
+	close(release)
+	require.ErrorContains(t, <-done, "instance changed")
+	require.Zero(t, canceled)
+	require.Zero(t, controller.stops)
+	current, err := resolver.Resolve("ds-1")
+	require.NoError(t, err)
+	require.Equal(t, "replacement", current.Handle.InstanceID())
 }

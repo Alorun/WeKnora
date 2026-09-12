@@ -4,10 +4,12 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,7 +22,7 @@ func TestCgroupDenyAudit(t *testing.T) {
 	if runID == "" {
 		t.Fatal("WEKNORA_PROTOTYPE_RUN_ID is required")
 	}
-	cgroupPath, err := CurrentCgroupPath("/sys/fs/cgroup")
+	cgroupPath, err := currentCgroupPath("/sys/fs/cgroup")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +67,23 @@ func TestCgroupDenyAudit(t *testing.T) {
 		}
 	}
 	t.Logf("denials=%+v events=%+v", errorsByAttempt, events)
+}
+
+func currentCgroupPath(root string) (string, error) {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			path := filepath.Join(root, strings.TrimPrefix(line, "0::"))
+			if _, err := os.Stat(path); err != nil {
+				return "", fmt.Errorf("stat current cgroup: %w", err)
+			}
+			return path, nil
+		}
+	}
+	return "", errors.New("cgroup v2 entry not found")
 }
 
 func tcpAttempt(network, target string) string {

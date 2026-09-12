@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"context"
 	"errors"
 
 	"github.com/Tencent/WeKnora/internal/plugin/control"
@@ -30,19 +29,5 @@ func (m *PluginManager) LoadExternal(manifest control.Manifest) error {
 	if err := m.catalog.Register(manifest.Definition()); err != nil {
 		return err
 	}
-	m.statuses[manifest.Metadata.ID] = control.PluginStatus{PluginID: manifest.Metadata.ID, State: control.StateStopped, UpdatedAt: m.now()}
 	return nil
-}
-
-func (m *PluginManager) HealthExternal(ctx context.Context, dsID string) (pr.HealthResult, error) {
-	m.mu.Lock()
-	runtime, handle := m.runtime, m.handles[dsID]
-	m.mu.Unlock()
-	if runtime == nil {
-		return pr.HealthResult{}, ErrRuntimeNotAvailable
-	}
-	if handle == nil {
-		return pr.HealthResult{}, ErrNotFound
-	}
-	return runtime.Health(ctx, handle)
 }

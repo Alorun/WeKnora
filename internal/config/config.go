@@ -292,17 +292,6 @@ const (
 	AuthDefaultTenantModeTenantless     = "tenantless"
 )
 
-// IsInviteOnly returns true when registration is gated behind invitations.
-// Treats nil receiver and empty/unknown values as "not invite-only" so the
-// default keeps current behaviour even if the section is missing from the
-// config file.
-func (c *AuthConfig) IsInviteOnly() bool {
-	if c == nil {
-		return false
-	}
-	return c.RegistrationMode == AuthRegistrationModeInviteOnly
-}
-
 type OIDCUserInfoMapping struct {
 	Username string `yaml:"username" json:"username"`
 	Email    string `yaml:"email"    json:"email"`

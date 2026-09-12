@@ -635,27 +635,3 @@ func (d *DataSource) ParseSyncCursor() (*SyncCursor, error) {
 	}
 	return &cursor, nil
 }
-
-// ParseSyncResult parses the result JSON
-func (d *DataSource) ParseSyncResult() (*SyncResult, error) {
-	if len(d.LastSyncResult) == 0 {
-		return nil, nil
-	}
-	var result SyncResult
-	if err := json.Unmarshal(d.LastSyncResult, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
-// ParseSyncLogResult parses the result JSON from sync log
-func (s *SyncLog) ParseResult() (*SyncResult, error) {
-	if len(s.Result) == 0 {
-		return nil, nil
-	}
-	var result SyncResult
-	if err := json.Unmarshal(s.Result, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}

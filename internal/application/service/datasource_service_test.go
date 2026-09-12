@@ -596,8 +596,8 @@ func TestProcessSync_SyncDeletionsLookupFailureCountsFailed(t *testing.T) {
 	assert.Empty(t, h.knowledgeSvc.deleted)
 	assert.Equal(t, 0, updated.ItemsDeleted)
 	assert.Equal(t, 1, updated.ItemsFailed)
-	result, err := updated.ParseResult()
-	require.NoError(t, err)
+	var result types.SyncResult
+	require.NoError(t, json.Unmarshal(updated.Result, &result))
 	require.Len(t, result.Errors, 1)
 	assert.Equal(t, "deletion_lookup_failed", result.Errors[0].Code)
 	assert.Equal(t, 1, deletionFailedCount(t, updated))
@@ -616,8 +616,8 @@ func TestProcessSync_SyncDeletionsDeleteFailureCountsFailed(t *testing.T) {
 	assert.Equal(t, []string{"knowledge-gone"}, h.knowledgeSvc.deleted)
 	assert.Equal(t, 0, updated.ItemsDeleted)
 	assert.Equal(t, 1, updated.ItemsFailed)
-	result, err := updated.ParseResult()
-	require.NoError(t, err)
+	var result types.SyncResult
+	require.NoError(t, json.Unmarshal(updated.Result, &result))
 	require.Len(t, result.Errors, 1)
 	assert.Equal(t, "deletion_failed", result.Errors[0].Code)
 	assert.Equal(t, 1, deletionFailedCount(t, updated))

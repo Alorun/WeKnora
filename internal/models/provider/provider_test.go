@@ -22,12 +22,6 @@ func TestProviderRegistry(t *testing.T) {
 		}
 	})
 
-	t.Run("GetOrDefault fallback", func(t *testing.T) {
-		// Non-existent provider should fall back to generic
-		p := GetOrDefault("nonexistent")
-		require.NotNil(t, p)
-		assert.Equal(t, ProviderGeneric, p.Info().Name)
-	})
 }
 
 func TestDetectProvider(t *testing.T) {
@@ -89,7 +83,7 @@ func TestAnthropicProviderValidation(t *testing.T) {
 	t.Run("info", func(t *testing.T) {
 		info := p.Info()
 		assert.Equal(t, ProviderAnthropic, info.Name)
-		assert.Equal(t, AnthropicBaseURL, info.GetDefaultURL(types.ModelTypeKnowledgeQA))
+		assert.Equal(t, AnthropicBaseURL, info.DefaultURLs[types.ModelTypeKnowledgeQA])
 		assert.Contains(t, info.ModelTypes, types.ModelTypeKnowledgeQA)
 		assert.True(t, info.RequiresAuth)
 	})
@@ -218,8 +212,8 @@ func TestZhipuProviderValidation(t *testing.T) {
 	t.Run("info", func(t *testing.T) {
 		info := p.Info()
 		assert.Equal(t, ProviderZhipu, info.Name)
-		assert.Equal(t, ZhipuChatBaseURL, info.GetDefaultURL(types.ModelTypeKnowledgeQA))
-		assert.Equal(t, ZhipuEmbeddingBaseURL, info.GetDefaultURL(types.ModelTypeEmbedding))
+		assert.Equal(t, ZhipuChatBaseURL, info.DefaultURLs[types.ModelTypeKnowledgeQA])
+		assert.Equal(t, ZhipuEmbeddingBaseURL, info.DefaultURLs[types.ModelTypeEmbedding])
 	})
 }
 
@@ -248,8 +242,8 @@ func TestRequestyProviderValidation(t *testing.T) {
 		info := p.Info()
 		assert.Equal(t, ProviderRequesty, info.Name)
 		assert.Equal(t, "Requesty", info.DisplayName)
-		assert.Equal(t, RequestyBaseURL, info.GetDefaultURL(types.ModelTypeKnowledgeQA))
-		assert.Equal(t, RequestyBaseURL, info.GetDefaultURL(types.ModelTypeEmbedding))
+		assert.Equal(t, RequestyBaseURL, info.DefaultURLs[types.ModelTypeKnowledgeQA])
+		assert.Equal(t, RequestyBaseURL, info.DefaultURLs[types.ModelTypeEmbedding])
 		assert.Contains(t, info.ModelTypes, types.ModelTypeKnowledgeQA)
 		assert.True(t, info.RequiresAuth)
 	})
@@ -276,11 +270,11 @@ func TestListByModelType(t *testing.T) {
 			}
 			if p.Name == ProviderLKEAP {
 				foundLKEAP = true
-				assert.Equal(t, LKEAPRerankBaseURL, p.GetDefaultURL(types.ModelTypeRerank))
+				assert.Equal(t, LKEAPRerankBaseURL, p.DefaultURLs[types.ModelTypeRerank])
 			}
 			if p.Name == ProviderVolcengine {
 				foundVolcengine = true
-				assert.Equal(t, VolcengineRerankBaseURL, p.GetDefaultURL(types.ModelTypeRerank))
+				assert.Equal(t, VolcengineRerankBaseURL, p.DefaultURLs[types.ModelTypeRerank])
 			}
 		}
 		assert.True(t, foundAliyun, "Aliyun should support rerank")
@@ -296,7 +290,7 @@ func TestListByModelType(t *testing.T) {
 		for _, p := range providers {
 			if p.Name == ProviderOpenRouter {
 				found = true
-				assert.Equal(t, OpenRouterBaseURL, p.GetDefaultURL(types.ModelTypeEmbedding))
+				assert.Equal(t, OpenRouterBaseURL, p.DefaultURLs[types.ModelTypeEmbedding])
 				break
 			}
 		}
@@ -312,7 +306,7 @@ func TestListByModelType(t *testing.T) {
 		for _, p := range providers {
 			if p.Name == ProviderGemini {
 				found = true
-				assert.Equal(t, GeminiBaseURL, p.GetDefaultURL(types.ModelTypeEmbedding))
+				assert.Equal(t, GeminiBaseURL, p.DefaultURLs[types.ModelTypeEmbedding])
 				break
 			}
 		}

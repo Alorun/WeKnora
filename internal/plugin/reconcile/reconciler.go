@@ -19,6 +19,7 @@ import (
 
 type Store interface {
 	ListBindings(context.Context) ([]control.DataSourcePluginBinding, error)
+	GetBinding(context.Context, string) (*control.DataSourcePluginBinding, error)
 	GetInstallation(context.Context, string) (*control.PluginInstallation, error)
 	GetDataSourceStatus(context.Context, string) (string, error)
 	UpdateBindingObserved(context.Context, string, uint64, control.PluginState, string, string) error
@@ -48,6 +49,7 @@ type Reconciler struct {
 	resolver   *plugindatasource.Resolver
 	specs      SpecBuilder
 	revisions  RevisionReconciler
+	cancelSync func(string, uint64, string)
 	grace      time.Duration
 }
 
@@ -64,17 +66,18 @@ func (r *Reconciler) WithLock(fn func() error) error { r.mu.Lock(); defer r.mu.U
 func New(
 	store Store, controller Controller, runtime pluginruntime.Runtime, backend pluginruntime.PluginSandboxBackend,
 	resolver *plugindatasource.Resolver, specs SpecBuilder, revisions RevisionReconciler,
+	cancelSync func(string, uint64, string),
 ) *Reconciler {
 	return &Reconciler{store: store, controller: controller, runtime: runtime, backend: backend,
-		resolver: resolver, specs: specs, revisions: revisions, grace: 5 * time.Second, retries: map[string]retry{}}
+		resolver: resolver, specs: specs, revisions: revisions, cancelSync: cancelSync,
+		grace: 5 * time.Second, retries: map[string]retry{}}
 }
 
+// Run performs periodic passes. The application performs the one initial pass
+// synchronously before opening QueuePlugin consumption.
 func (r *Reconciler) Run(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		return fmt.Errorf("reconcile interval must be positive")
-	}
-	if err := r.ReconcileOnce(ctx); err != nil {
-		logger.Warnf(ctx, "[PluginReconciler] initial pass: %v", err)
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -163,19 +166,8 @@ func (r *Reconciler) reconcileBinding(
 		if !ok {
 			return r.observe(ctx, binding, control.StateFailed, resolved.Handle.InstanceID(), errors.New("published handle is not a runtime handle"))
 		}
-		health, healthErr := r.runtime.Health(ctx, runtimeHandle)
-		if healthErr == nil && health.Status == pluginv1.HealthStatus_HEALTH_STATUS_READY {
-			delete(r.retries, binding.DataSourceID) // survived a full reconciliation interval
-			return r.observe(ctx, binding, control.StateReady, runtimeHandle.InstanceID(), nil)
-		}
-		// One bounded restart per pass. Stop unpublishes before any replacement.
-		if stopErr := r.controller.StopExternal(ctx, binding.InstallationID, binding.DataSourceID, r.grace); stopErr != nil {
-			return r.observe(ctx, binding, control.StateFailed, runtimeHandle.InstanceID(), errors.Join(healthErr, stopErr))
-		}
-		if healthErr == nil {
-			healthErr = errors.New("plugin health is not READY")
-		}
-		return r.observe(ctx, binding, control.StateNotReady, "", healthErr)
+		_, err := r.checkHealth(ctx, binding, runtimeHandle, true)
+		return err
 	} else if resolveErr == nil {
 		if stopErr := r.controller.StopExternal(ctx, binding.InstallationID, binding.DataSourceID, r.grace); stopErr != nil {
 			return r.observe(ctx, binding, control.StateFailed, resolved.Handle.InstanceID(), stopErr)
@@ -186,11 +178,6 @@ func (r *Reconciler) reconcileBinding(
 	// consumer. Existing backend instances are inspected then safely rebuilt;
 	// no fake Recover RPC or implicit READY is used.
 	for _, instance := range backendInstances {
-		state, inspectErr := r.backend.Inspect(ctx, instance.ID)
-		if inspectErr != nil {
-			return r.observe(ctx, binding, control.StateFailed, instance.ID, inspectErr)
-		}
-		_ = state
 		if stopErr := r.backend.Stop(ctx, instance.ID, r.grace); stopErr != nil {
 			return r.observe(ctx, binding, control.StateFailed, instance.ID, stopErr)
 		}
@@ -208,6 +195,57 @@ func (r *Reconciler) reconcileBinding(
 		return r.observe(ctx, binding, control.StateNotReady, "", err)
 	}
 	return r.observe(ctx, binding, control.StateReady, handle.InstanceID(), nil)
+}
+
+// Health applies the same identity fence and cleanup order as periodic health
+// reconciliation without consuming the automatic restart budget.
+func (r *Reconciler) Health(ctx context.Context, dataSourceID string) (pluginruntime.HealthResult, error) {
+	if r == nil || r.store == nil || r.controller == nil || r.runtime == nil || r.resolver == nil {
+		return pluginruntime.HealthResult{}, fmt.Errorf("plugin reconciler is not fully configured")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	binding, err := r.store.GetBinding(ctx, dataSourceID)
+	if err != nil {
+		return pluginruntime.HealthResult{}, err
+	}
+	resolved, err := r.resolver.Resolve(dataSourceID)
+	if err != nil {
+		return pluginruntime.HealthResult{}, err
+	}
+	handle, ok := resolved.Handle.(pluginruntime.RuntimeHandle)
+	if !ok || resolved.Generation != binding.Generation {
+		return pluginruntime.HealthResult{}, errors.New("published handle does not match the current binding")
+	}
+	return r.checkHealth(ctx, *binding, handle, false)
+}
+
+func (r *Reconciler) checkHealth(
+	ctx context.Context, binding control.DataSourcePluginBinding, handle pluginruntime.RuntimeHandle, countRetry bool,
+) (pluginruntime.HealthResult, error) {
+	health, healthErr := r.runtime.Health(ctx, handle)
+	current, resolveErr := r.resolver.Resolve(binding.DataSourceID)
+	if resolveErr != nil || current.Generation != binding.Generation || current.Handle.InstanceID() != handle.InstanceID() {
+		return health, errors.New("plugin instance changed while health check was in flight")
+	}
+	if healthErr == nil && health.Status == pluginv1.HealthStatus_HEALTH_STATUS_READY {
+		if countRetry {
+			delete(r.retries, binding.DataSourceID) // survived a full reconciliation interval
+		}
+		return health, r.record(ctx, binding, control.StateReady, handle.InstanceID(), nil, false)
+	}
+	if healthErr == nil {
+		healthErr = errors.New("plugin health is not READY")
+	}
+	if r.cancelSync != nil {
+		r.cancelSync(binding.DataSourceID, binding.Generation, handle.InstanceID())
+	}
+	stopErr := r.controller.StopExternal(ctx, binding.InstallationID, binding.DataSourceID, r.grace)
+	state, locator := control.StateNotReady, ""
+	if stopErr != nil {
+		state, locator = control.StateFailed, handle.InstanceID()
+	}
+	return health, r.record(ctx, binding, state, locator, errors.Join(healthErr, stopErr), countRetry)
 }
 
 func (r *Reconciler) listManaged(ctx context.Context) (map[string][]pluginruntime.BackendInstance, error) {
@@ -231,6 +269,12 @@ func (r *Reconciler) listManaged(ctx context.Context) (map[string][]pluginruntim
 func (r *Reconciler) observe(
 	ctx context.Context, binding control.DataSourcePluginBinding, state control.PluginState, sandboxID string, cause error,
 ) error {
+	return r.record(ctx, binding, state, sandboxID, cause, true)
+}
+
+func (r *Reconciler) record(
+	ctx context.Context, binding control.DataSourcePluginBinding, state control.PluginState, sandboxID string, cause error, countRetry bool,
+) error {
 	message := ""
 	if cause != nil {
 		message = cause.Error()
@@ -238,7 +282,7 @@ func (r *Reconciler) observe(
 			sandboxID = binding.SandboxID
 		} // retain cleanup location until a successful observation
 	}
-	if state == control.StateNotReady && cause != nil {
+	if countRetry && state == control.StateNotReady && cause != nil {
 		entry := r.retries[binding.DataSourceID]
 		if entry.generation != binding.Generation {
 			entry = retry{generation: binding.Generation}
@@ -249,6 +293,8 @@ func (r *Reconciler) observe(
 	} else if state == control.StateStopped {
 		delete(r.retries, binding.DataSourceID)
 	}
-	updateErr := r.store.UpdateBindingObserved(ctx, binding.DataSourceID, binding.Generation, state, sandboxID, message)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	updateErr := r.store.UpdateBindingObserved(persistCtx, binding.DataSourceID, binding.Generation, state, sandboxID, message)
 	return errors.Join(cause, updateErr)
 }

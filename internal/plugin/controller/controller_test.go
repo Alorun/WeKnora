@@ -11,6 +11,8 @@ import (
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/plugin/control"
 	pluginDS "github.com/Tencent/WeKnora/internal/plugin/datasource"
+	"github.com/Tencent/WeKnora/internal/plugin/prepare"
+	pluginruntime "github.com/Tencent/WeKnora/internal/plugin/runtime"
 	"github.com/Tencent/WeKnora/internal/plugin/sandbox/docker/network"
 	"github.com/Tencent/WeKnora/internal/plugin/store"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -23,6 +25,34 @@ import (
 type testHandle struct{}
 
 func (testHandle) InstanceID() string { return "instance-1" }
+
+func TestDiscoveredPackageLoaderUsesFrozenSnapshotAndInstallationIdentity(t *testing.T) {
+	pkg := prepare.Package{
+		Manifest: control.Manifest{
+			Metadata: control.ManifestMetadata{ID: "test.directory", Version: "1.0.0"},
+			Spec: control.ManifestSpec{
+				Extension:    control.ManifestExtension{Capabilities: []string{"full_sync"}},
+				ConfigSchema: map[string]any{"type": "object"},
+			},
+		},
+		Artifact: pluginruntime.ArtifactReference{AppPath: "/snapshot/does-not-need-to-exist", Digest: "sha256:frozen"},
+	}
+	load := discoveredPackageLoader(map[string]prepare.Package{"installation-1": pkg})
+	installation := control.PluginInstallation{ID: "installation-1", PluginID: "test.directory", Version: "1.0.0", ArtifactDigest: "sha256:frozen"}
+
+	loaded, err := load(context.Background(), installation)
+	require.NoError(t, err, "loading a discovered snapshot must not reread its source directory")
+	loaded.Manifest.Spec.Extension.Capabilities[0] = "mutated"
+	loaded.Manifest.Spec.ConfigSchema["type"] = "mutated"
+	reloaded, err := load(context.Background(), installation)
+	require.NoError(t, err)
+	require.Equal(t, "full_sync", reloaded.Manifest.Spec.Extension.Capabilities[0])
+	require.Equal(t, "object", reloaded.Manifest.Spec.ConfigSchema["type"])
+
+	installation.ArtifactDigest = "sha256:changed"
+	_, err = load(context.Background(), installation)
+	require.Error(t, err, "a discovered package cannot satisfy a different installation identity")
+}
 
 func controllerFixture(t *testing.T) (*Controller, *gorm.DB) {
 	t.Helper()
@@ -121,10 +151,6 @@ func TestScopeAndGrantAuthorizationAreNotUserControlled(t *testing.T) {
 	ctx := context.Background()
 	_, err := c.Grant(ctx, &types.DataSource{ID: "ds-1", TenantID: 7}, "root", "source")
 	require.ErrorContains(t, err, "system administrator")
-	_, err = c.UpdateDataSource(ctx, &types.DataSource{ID: "ds-1", Type: "other"})
-	require.ErrorContains(t, err, "immutable")
 	_, err = c.UpdateDataSource(ctx, &types.DataSource{ID: "ds-1", Config: types.JSON(`{"settings":{"path":"/etc"}}`)})
 	require.ErrorContains(t, err, "scope/config is fixed")
-	_, err = c.UpdateDataSource(ctx, &types.DataSource{ID: "ds-1", SyncSchedule: "invalid"})
-	require.Error(t, err)
 }

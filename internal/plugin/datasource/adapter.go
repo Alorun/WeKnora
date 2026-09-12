@@ -301,6 +301,9 @@ func upsertFromProto(upsert *pluginv1.DocumentUpsert) (types.FetchedItem, error)
 	if len(upsert.GetContent()) > pluginsdk.MaxDocumentBytes {
 		return types.FetchedItem{}, fmt.Errorf("%s: document exceeds %d bytes", pluginsdk.ErrorMessageTooLarge, pluginsdk.MaxDocumentBytes)
 	}
+	if upsert.GetReplacesSubtree() || len(upsert.GetSubtreeKeep()) != 0 {
+		return types.FetchedItem{}, fmt.Errorf("%s: subtree replacement is not supported for external datasource plugins in V1", pluginsdk.ErrorUnsupportedCapability)
+	}
 	item := types.FetchedItem{
 		ExternalID: upsert.GetExternalId(), Revision: upsert.GetRevision(), Title: upsert.GetTitle(),
 		Content: append([]byte(nil), upsert.GetContent()...), ContentType: upsert.GetContentType(),

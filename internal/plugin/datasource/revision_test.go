@@ -202,8 +202,9 @@ func TestRevisionReplayAndFailedReplacementKeepOldActive(t *testing.T) {
 	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", *r1.KnowledgeID).
 		Update("parse_status", types.ParseStatusCompleted).Error)
 	require.NoError(t, processor.ReconcilePending(ctx, 10))
-	r1, err = store.GetActiveRevision(ctx, "ds-1", "a.md")
+	r1, err = store.GetRevision(ctx, "ds-1", "a.md", "r1")
 	require.NoError(t, err)
+	require.Equal(t, control.RevisionActive, r1.State)
 	var oldKnowledge types.Knowledge
 	require.NoError(t, db.First(&oldKnowledge, "id = ?", *r1.KnowledgeID).Error)
 	require.Equal(t, "enabled", oldKnowledge.EnableStatus)
@@ -222,8 +223,9 @@ func TestRevisionReplayAndFailedReplacementKeepOldActive(t *testing.T) {
 	r2, err = store.GetRevision(ctx, "ds-1", "a.md", "r2")
 	require.NoError(t, err)
 	require.Equal(t, control.RevisionFailed, r2.State)
-	active, err := store.GetActiveRevision(ctx, "ds-1", "a.md")
+	active, err := store.GetRevision(ctx, "ds-1", "a.md", "r1")
 	require.NoError(t, err)
+	require.Equal(t, control.RevisionActive, active.State)
 	require.Equal(t, "r1", active.Revision)
 	require.NoError(t, db.First(&oldKnowledge, "id = ?", *active.KnowledgeID).Error)
 	require.Equal(t, "enabled", oldKnowledge.EnableStatus)

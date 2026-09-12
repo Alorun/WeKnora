@@ -86,6 +86,18 @@ func (c *Controller) BeginSync(ctx context.Context, id string, generation uint64
 	return runCtx, func() { cancel(); c.gate.Lock(); delete(c.syncs, id); c.gate.Unlock() }, nil
 }
 
+func (c *Controller) cancelSyncForInstance(id string, generation uint64, instanceID string) {
+	c.gate.Lock()
+	defer c.gate.Unlock()
+	resolved, err := c.routes.Resolve(id)
+	if err != nil || resolved.Generation != generation || resolved.Handle.InstanceID() != instanceID {
+		return
+	}
+	if cancel := c.syncs[id]; cancel != nil {
+		cancel()
+	}
+}
+
 // Linearization point shared with desired-state changes: a revoked generation
 // cannot accept an event or save Cursor after the revocation transaction.
 func (c *Controller) WithSync(ctx context.Context, id string, fn func() error) error {

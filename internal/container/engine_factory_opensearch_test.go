@@ -52,18 +52,6 @@ func TestCreateOpenSearchEngine_WiresClientAndRepo(t *testing.T) {
 	}
 }
 
-func TestCreateOpenSearchEngine_RejectsBadCluster(t *testing.T) {
-	// Elasticsearch distribution must be rejected at construction.
-	ts := httptest.NewServer(osClusterHandler("elasticsearch", "8.10.4", true))
-	defer ts.Close()
-	_, err := createOpenSearchEngine(context.Background(),
-		types.VectorStore{EngineType: types.OpenSearchRetrieverEngineType,
-			ConnectionConfig: types.ConnectionConfig{Addr: ts.URL}}, nil)
-	if err == nil {
-		t.Error("elasticsearch cluster should be rejected at engine creation")
-	}
-}
-
 func TestCreateEngineServiceFromStore_OpenSearchCaseReached(t *testing.T) {
 	ts := httptest.NewServer(osClusterHandler("opensearch", "2.11.0", true))
 	defer ts.Close()

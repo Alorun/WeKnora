@@ -140,6 +140,9 @@ func NewAnthropicChat(config *ChatConfig) (*AnthropicChat, error) {
 }
 
 func (c *AnthropicChat) Chat(ctx context.Context, messages []Message, opts *ChatOptions) (*types.ChatResponse, error) {
+	if err := provider.RequireCapability(provider.ProviderAnthropic, provider.CapabilityChat); err != nil {
+		return nil, err
+	}
 	reqBody := c.buildRequest(ctx, messages, opts)
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -203,6 +206,9 @@ func (c *AnthropicChat) Chat(ctx context.Context, messages []Message, opts *Chat
 }
 
 func (c *AnthropicChat) ChatStream(ctx context.Context, messages []Message, opts *ChatOptions) (<-chan types.StreamResponse, error) {
+	if err := provider.RequireCapability(provider.ProviderAnthropic, provider.CapabilityChat); err != nil {
+		return nil, err
+	}
 	reqBody := c.buildRequest(ctx, messages, opts)
 	reqBody.Stream = true
 	jsonData, err := json.Marshal(reqBody)

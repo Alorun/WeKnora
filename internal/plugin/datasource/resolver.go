@@ -3,7 +3,6 @@
 package datasource
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -116,19 +115,6 @@ func (r *Resolver) Acquire(dataSourceID string) (*Lease, error) {
 func (r *Resolver) Unpublish(dataSourceID string, generation uint64) error {
 	_, err := r.unpublish(dataSourceID, generation, "")
 	return err
-}
-
-func (r *Resolver) UnpublishAndDrain(ctx context.Context, dataSourceID string, generation uint64) error {
-	drained, err := r.unpublish(dataSourceID, generation, "")
-	if err != nil || drained == nil {
-		return err
-	}
-	select {
-	case <-drained:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // UnpublishInstance removes only this exact incarnation. Recovery may restart

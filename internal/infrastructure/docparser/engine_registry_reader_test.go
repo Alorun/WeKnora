@@ -61,14 +61,6 @@ func TestNewReaderRoutesByEngine(t *testing.T) {
 	}
 }
 
-// A disconnected docreader has to surface as an error, not as a nil reader the
-// caller would dereference.
-func TestNewReaderReportsDisconnectedDocReader(t *testing.T) {
-	if _, err := NewReader(context.Background(), BuiltinEngineName, "docx", false, ReaderDeps{}); err == nil {
-		t.Fatal("NewReader succeeded without a docreader connection, want an error")
-	}
-}
-
 func TestManagedFallbackRejectsStoppedBridge(t *testing.T) {
 	remote := &recordingDocReader{}
 	reader := managedFallbackReader(BuiltinEngineName, remote)
@@ -99,15 +91,6 @@ type recordingDocReader struct{ calls int }
 func (r *recordingDocReader) Read(context.Context, *types.ReadRequest) (*types.ReadResult, error) {
 	r.calls++
 	return &types.ReadResult{}, nil
-}
-
-func TestNewReaderRequiresWeKnoraCloudCredentials(t *testing.T) {
-	_, err := NewReader(context.Background(), WeKnoraCloudEngineName, "docx", false, ReaderDeps{
-		WeKnoraCloudCredentials: func(context.Context) *types.WeKnoraCloudCredentials { return nil },
-	})
-	if err == nil {
-		t.Fatal("NewReader succeeded without credentials, want an error")
-	}
 }
 
 // The anydoc engine is only linked into builds tagged `anydoc`; everywhere

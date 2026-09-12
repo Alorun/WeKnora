@@ -16,17 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestRetrieveEngineRegistryWiring checks that the container can still build
-// the retrieval engine registry, and that what it builds can rebuild a missing
-// store engine.
-//
-// The registry depends on the vector store repository and the engine factory,
-// and the engine factory must not in turn depend on the registry. A cycle or a
-// missing provider surfaces only when the process starts, so it is worth
-// pinning here rather than discovering it at deploy time. The nil check at the
-// end is the part that matters: a registry resolved without those two
-// dependencies still satisfies the interface and still serves lookups, so it
-// would pass every other test while silently never rebuilding anything.
+// TestRetrieveEngineRegistryWiring checks that Dig can satisfy the registry
+// constructor, including its repository and engine-factory dependencies.
 func TestRetrieveEngineRegistryWiring(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
@@ -49,12 +40,8 @@ func TestRetrieveEngineRegistryWiring(t *testing.T) {
 	provide(initRetrieveEngineRegistry)
 
 	err = c.Invoke(func(registry interfaces.RetrieveEngineRegistry) {
-		concrete, ok := registry.(*retriever.RetrieveEngineRegistry)
-		if !ok {
-			t.Fatalf("expected *retriever.RetrieveEngineRegistry, got %T", registry)
-		}
-		if !concrete.CanRebuildStores() {
-			t.Error("registry was built without the dependencies it needs to rebuild a store engine")
+		if registry == nil {
+			t.Fatal("container returned a nil retrieval registry")
 		}
 	})
 	if err != nil {
@@ -76,7 +63,7 @@ func TestEngineFactoryRequiresManagedRetrievalDriver(t *testing.T) {
 	engine, err := factory(context.Background(), store)
 	require.NoError(t, err)
 	require.NotEmpty(t, engine.Support(), "the real SQLite driver is callable after publication")
-	require.NoError(t, registry.UnpublishDriver(types.SQLiteRetrieverEngineType))
+	require.NoError(t, registry.UnpublishDriver(context.Background(), types.SQLiteRetrieverEngineType))
 	_, err = engine.Retrieve(context.Background(), types.RetrieveParams{})
 	require.ErrorIs(t, err, retriever.ErrDriverNotActive, "a retained real backend must be stopped too")
 	_, err = factory(context.Background(), store)

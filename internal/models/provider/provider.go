@@ -112,18 +112,6 @@ type ProviderInfo struct {
 	ExtraFields  []ExtraFieldConfig         // 额外配置字段
 }
 
-// GetDefaultURL 获取指定模型类型的默认 URL
-func (p ProviderInfo) GetDefaultURL(modelType types.ModelType) string {
-	if url, ok := p.DefaultURLs[modelType]; ok {
-		return url
-	}
-	// 回退到 Chat URL
-	if url, ok := p.DefaultURLs[types.ModelTypeKnowledgeQA]; ok {
-		return url
-	}
-	return ""
-}
-
 // ExtraFieldConfig 定义提供者的额外配置字段
 type ExtraFieldConfig struct {
 	Key         string `json:"key"`
@@ -314,21 +302,6 @@ func RequireCapability(name ProviderName, capability Capability) error {
 	return nil
 }
 
-// GetOrDefault 通过名称从注册表中获取提供者，如果未找到则返回默认提供者
-func GetOrDefault(name ProviderName) Provider {
-	registryMu.RLock()
-	defer registryMu.RUnlock()
-	if p, ok := registry[name]; ok {
-		return p
-	}
-	// A known built-in that has been stopped must not silently turn into the
-	// generic provider. Preserve the legacy fallback only for unknown names.
-	if _, declared := declarations[name]; declared {
-		return nil
-	}
-	return registry[ProviderGeneric]
-}
-
 // List 返回所有注册的提供者（按 AllProviders 定义的顺序）
 func List() []ProviderInfo {
 	registryMu.RLock()
@@ -433,23 +406,4 @@ func containsAny(s string, substrs ...string) bool {
 		}
 	}
 	return false
-}
-
-func NewConfigFromModel(model *types.Model) (*Config, error) {
-	if model == nil {
-		return nil, fmt.Errorf("model is nil")
-	}
-
-	providerName := ProviderName(model.Parameters.Provider)
-	if providerName == "" {
-		providerName = DetectProvider(model.Parameters.BaseURL)
-	}
-
-	return &Config{
-		Provider:  providerName,
-		BaseURL:   model.Parameters.BaseURL,
-		APIKey:    model.Parameters.APIKey,
-		ModelName: model.Name,
-		ModelID:   model.ID,
-	}, nil
 }

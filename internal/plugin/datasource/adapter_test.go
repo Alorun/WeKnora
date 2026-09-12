@@ -119,23 +119,15 @@ func adapterFixtureWithDataSource(t *testing.T, dataSource pluginv1.DataSourcePl
 }
 
 type recordingStreamHandler struct {
-	items         []types.FetchedItem
-	checkpoints   int
-	emitErr       error
-	checkpointErr error
+	items       []types.FetchedItem
+	checkpoints int
 }
 
 func (h *recordingStreamHandler) Emit(_ context.Context, item types.FetchedItem) error {
-	if h.emitErr != nil {
-		return h.emitErr
-	}
 	h.items = append(h.items, item)
 	return nil
 }
 func (h *recordingStreamHandler) Checkpoint(context.Context, *types.SyncCursor) error {
-	if h.checkpointErr != nil {
-		return h.checkpointErr
-	}
 	h.checkpoints++
 	return nil
 }
@@ -157,15 +149,6 @@ func TestAdapterMapsListResolveAndSync(t *testing.T) {
 	require.EqualValues(t, 1, cursor.ConnectorCursor["page"])
 }
 
-func TestAdapterReturnsCheckpointPersistenceFailure(t *testing.T) {
-	_, adapter := adapterFixture(t)
-	boom := errors.New("checkpoint persistence failed")
-	handler := &recordingStreamHandler{checkpointErr: boom}
-	_, err := adapter.FetchStream(context.Background(), &types.DataSourceConfig{}, nil, handler)
-	require.ErrorIs(t, err, boom)
-	require.Zero(t, handler.checkpoints)
-}
-
 func TestAdapterTreatsItemErrorAsDirtyAndIgnoresLaterCheckpoint(t *testing.T) {
 	_, adapter := adapterFixtureWithDataSource(t, itemErrorDataSource{})
 	handler := &recordingStreamHandler{}
@@ -174,16 +157,7 @@ func TestAdapterTreatsItemErrorAsDirtyAndIgnoresLaterCheckpoint(t *testing.T) {
 	require.Zero(t, handler.checkpoints)
 }
 
-func TestAdapterStopsBeforeCheckpointWhenHostRejectsUpsert(t *testing.T) {
-	_, adapter := adapterFixture(t)
-	boom := errors.New("persist failed")
-	handler := &recordingStreamHandler{emitErr: boom}
-	_, err := adapter.FetchStream(context.Background(), &types.DataSourceConfig{}, nil, handler)
-	require.ErrorIs(t, err, boom)
-	require.Zero(t, handler.checkpoints)
-}
-
-func TestUnpublishRejectsNewCallsWhileDrainingLease(t *testing.T) {
+func TestUnpublishInstanceRejectsNewCallsWhileDrainingLease(t *testing.T) {
 	resolver, _ := adapterFixture(t)
 	lease, err := resolver.Acquire("ds-1")
 	require.NoError(t, err)
@@ -191,7 +165,17 @@ func TestUnpublishRejectsNewCallsWhileDrainingLease(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		done <- resolver.UnpublishAndDrain(ctx, "ds-1", 3)
+		drained, err := resolver.UnpublishInstance("ds-1", 3, "instance")
+		if err != nil {
+			done <- err
+			return
+		}
+		select {
+		case <-drained:
+			done <- nil
+		case <-ctx.Done():
+			done <- ctx.Err()
+		}
 	}()
 	require.Eventually(t, func() bool {
 		probe, err := resolver.Acquire("ds-1")

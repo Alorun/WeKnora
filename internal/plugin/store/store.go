@@ -55,12 +55,6 @@ func (s *Store) GetInstallation(ctx context.Context, id string) (*control.Plugin
 	return &installation, nil
 }
 
-func (s *Store) ListActiveInstallations(ctx context.Context) ([]control.PluginInstallation, error) {
-	var installations []control.PluginInstallation
-	err := s.db.WithContext(ctx).Where("active = ?", true).Order("plugin_id ASC").Find(&installations).Error
-	return installations, err
-}
-
 func (s *Store) UpdateInstallationState(
 	ctx context.Context, id string, enabled bool, installStatus, lastError string,
 ) error {
@@ -68,13 +62,6 @@ func (s *Store) UpdateInstallationState(
 		"enabled": enabled, "install_status": installStatus, "last_error": lastError, "updated_at": time.Now(),
 	})
 	return affected(result)
-}
-
-func (s *Store) CreateBinding(ctx context.Context, binding *control.DataSourcePluginBinding) error {
-	if binding == nil {
-		return errors.New("binding is required")
-	}
-	return s.db.WithContext(ctx).Create(binding).Error
 }
 
 func (s *Store) GetBinding(ctx context.Context, dataSourceID string) (*control.DataSourcePluginBinding, error) {
@@ -150,24 +137,6 @@ func (s *Store) GetActiveDirectoryGrant(ctx context.Context, dataSourceID string
 	return &grant, nil
 }
 
-func (s *Store) RevokeDirectoryGrant(ctx context.Context, id string, nextGeneration uint64) error {
-	now := time.Now()
-	result := s.db.WithContext(ctx).Model(&control.DirectoryGrant{}).
-		Where("id = ? AND status = ? AND generation < ?", id, control.GrantStatusActive, nextGeneration).
-		Updates(map[string]any{
-			"status": control.GrantStatusRevoked, "generation": nextGeneration,
-			"revoked_at": now, "updated_at": now,
-		})
-	return affected(result)
-}
-
-func (s *Store) CreateRevision(ctx context.Context, revision *control.DataSourceRevision) error {
-	if revision == nil {
-		return errors.New("revision is required")
-	}
-	return s.db.WithContext(ctx).Create(revision).Error
-}
-
 // CreateKnowledge writes a pending revision and its disabled Knowledge row in
 // one database transaction. It implements interfaces.KnowledgeRecordPersister
 // through pendingRevisionPersister in the datasource package rather than being
@@ -219,17 +188,6 @@ func (s *Store) GetRevision(
 	err := s.db.WithContext(ctx).
 		Where("data_source_id = ? AND external_id = ? AND revision = ?", dataSourceID, externalID, revision).
 		First(&result).Error
-	if err != nil {
-		return nil, normalizeNotFound(err)
-	}
-	return &result, nil
-}
-
-func (s *Store) GetActiveRevision(ctx context.Context, dataSourceID, externalID string) (*control.DataSourceRevision, error) {
-	var result control.DataSourceRevision
-	err := s.db.WithContext(ctx).Where(
-		"data_source_id = ? AND external_id = ? AND state = ?", dataSourceID, externalID, control.RevisionActive,
-	).First(&result).Error
 	if err != nil {
 		return nil, normalizeNotFound(err)
 	}
@@ -384,21 +342,6 @@ func (s *Store) FailRevision(ctx context.Context, revision control.DataSourceRev
 		"data_source_id = ? AND external_id = ? AND revision = ? AND state = ?",
 		revision.DataSourceID, revision.ExternalID, revision.Revision, control.RevisionPending,
 	).Updates(map[string]any{"state": control.RevisionFailed, "last_error": lastError, "updated_at": time.Now()})
-	return affected(result)
-}
-
-func (s *Store) TransitionRevision(
-	ctx context.Context, dataSourceID, externalID, revision, from, to, lastError string, knowledgeID *string,
-) error {
-	updates := map[string]any{"state": to, "last_error": lastError, "knowledge_id": knowledgeID, "updated_at": time.Now()}
-	if to == control.RevisionActive {
-		updates["activated_at"] = time.Now()
-	}
-	result := s.db.WithContext(ctx).Model(&control.DataSourceRevision{}).
-		Where(
-			"data_source_id = ? AND external_id = ? AND revision = ? AND state = ?",
-			dataSourceID, externalID, revision, from,
-		).Updates(updates)
 	return affected(result)
 }
 

@@ -221,11 +221,13 @@ func (r *RetrieveEngineRegistry) PublishDriver(engineType types.RetrieverEngineT
 	return nil
 }
 
-func (r *RetrieveEngineRegistry) UnpublishDriver(engineType types.RetrieverEngineType) error {
+func (r *RetrieveEngineRegistry) UnpublishDriver(ctx context.Context, engineType types.RetrieverEngineType) error {
 	if !r.SupportsDriver(engineType) {
 		return fmt.Errorf("%s: %w", engineType, ErrDriverUnsupported)
 	}
-	r.driverGate.deactivate(engineType)
+	if err := r.driverGate.deactivate(ctx, engineType); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.byEngineType, engineType)
@@ -463,14 +465,6 @@ func (r *RetrieveEngineRegistry) UnregisterByStoreID(storeID string) {
 // Compile-time assertion: *RetrieveEngineRegistry satisfies the
 // interfaces.RetrieveEngineRegistry contract, including GetByStoreID.
 var _ interfaces.RetrieveEngineRegistry = (*RetrieveEngineRegistry)(nil)
-
-// CanRebuildStores reports whether the registry was given what it needs to
-// rebuild a store engine on demand. Exposed so that wiring can be asserted:
-// a registry without those dependencies still serves lookups, so nothing else
-// would reveal that rebuilding was silently left off.
-func (r *RetrieveEngineRegistry) CanRebuildStores() bool {
-	return r.repo != nil && r.factory != nil
-}
 
 // doChanJoin attaches the caller to a build for key, starting one if none is
 // running, and reports the attachment to onFlightJoin.

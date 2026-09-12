@@ -191,9 +191,6 @@ func NewRemoteChat(config *ChatConfig) (Chat, error) {
 	if providerName == "" {
 		providerName = provider.DetectProvider(config.BaseURL)
 	}
-	if err := provider.RequireCapability(providerName, provider.CapabilityChat); err != nil {
-		return nil, err
-	}
 	if providerName == provider.ProviderAnthropic {
 		return NewAnthropicChat(config)
 	}

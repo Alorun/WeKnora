@@ -7,6 +7,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/plugin/control"
 	"github.com/Tencent/WeKnora/internal/plugin/sandbox/docker/paths"
@@ -159,7 +160,11 @@ func TestGrantAndBuilderUseExistingStore(t *testing.T) {
 	require.NoError(t, os.Mkdir(grant.CanonicalHostPath, 0755))
 	_, err = b.BuildInstanceSpec(ctx, installation, binding)
 	require.ErrorContains(t, err, "inode")
-	require.NoError(t, store.RevokeDirectoryGrant(ctx, grant.ID, 2))
+	require.NoError(t, db.Model(&control.DirectoryGrant{}).Where("id = ?", grant.ID).Updates(map[string]any{
+		"status":     control.GrantStatusRevoked,
+		"generation": 2,
+		"revoked_at": time.Now().UTC(),
+	}).Error)
 	_, err = b.BuildInstanceSpec(ctx, installation, binding)
 	require.Error(t, err)
 }

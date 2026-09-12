@@ -206,6 +206,21 @@ func TestBuiltinDescriptorsPublishAndStopAllFiveExtensionTypes(t *testing.T) {
 		t.Fatalf("parser business factory: %v", err)
 	}
 	assertModelFactoriesReady(t)
+	retainedGenericChat, err := chat.NewRemoteChat(modelChatConfig())
+	require.NoError(t, err)
+	customChatConfig := modelChatConfig()
+	customChatConfig.Provider = "custom-openai-compatible"
+	retainedCustomChat, err := chat.NewRemoteChat(customChatConfig)
+	require.NoError(t, err)
+	nvidiaHeldConfig := modelChatConfig()
+	nvidiaHeldConfig.Provider = string(provider.ProviderNvidia)
+	retainedNvidiaChat, err := chat.NewRemoteChat(nvidiaHeldConfig)
+	require.NoError(t, err)
+	anthropicHeldConfig := modelChatConfig()
+	anthropicHeldConfig.Provider = string(provider.ProviderAnthropic)
+	anthropicHeldConfig.APIKey = "test-key"
+	retainedAnthropicChat, err := chat.NewRemoteChat(anthropicHeldConfig)
+	require.NoError(t, err)
 	retainedParser, err := docparser.NewReader(ctx, docparser.SimpleEngineName, "md", false, docparser.ReaderDeps{})
 	require.NoError(t, err)
 	parsed, err := retainedParser.Read(ctx, &types.ReadRequest{FileType: "md", FileName: "a.md", FileContent: []byte("# lifecycle")})
@@ -261,6 +276,8 @@ func TestBuiltinDescriptorsPublishAndStopAllFiveExtensionTypes(t *testing.T) {
 	// A known stopped provider must not take the still-active generic route,
 	// including provider-specific embedding and rerank switch branches.
 	require.NoError(t, manager.Stop(ctx, "builtin.model_provider_nvidia"))
+	_, err = retainedNvidiaChat.Chat(ctx, nil, &chat.ChatOptions{})
+	require.ErrorIs(t, err, provider.ErrProviderNotActive, "a retained model must not start a request after Stop")
 	nvidiaChat := modelChatConfig()
 	nvidiaChat.Provider = string(provider.ProviderNvidia)
 	_, err = chat.NewRemoteChat(nvidiaChat)
@@ -269,12 +286,22 @@ func TestBuiltinDescriptorsPublishAndStopAllFiveExtensionTypes(t *testing.T) {
 	require.ErrorIs(t, err, provider.ErrProviderNotActive)
 	_, err = rerank.NewReranker(&rerank.RerankerConfig{Source: types.ModelSourceRemote, Provider: string(provider.ProviderNvidia)})
 	require.ErrorIs(t, err, provider.ErrProviderNotActive)
+	require.NoError(t, manager.Stop(ctx, "builtin.model_provider_anthropic"))
+	_, err = retainedAnthropicChat.Chat(ctx, nil, &chat.ChatOptions{})
+	require.ErrorIs(t, err, provider.ErrProviderNotActive)
+	_, err = retainedAnthropicChat.ChatStream(ctx, nil, &chat.ChatOptions{})
+	require.ErrorIs(t, err, provider.ErrProviderNotActive)
 
 	require.NoError(t, manager.Stop(ctx, "builtin.model_provider_generic"))
 	if _, active := provider.Get(provider.ProviderGeneric); active {
 		t.Fatal("stopped model provider metadata remained published")
 	}
-	require.Nil(t, provider.GetOrDefault(provider.ProviderGeneric), "stopped provider fell through to generic")
+	for _, retained := range []chat.Chat{retainedGenericChat, retainedCustomChat} {
+		_, err = retained.Chat(ctx, nil, &chat.ChatOptions{})
+		require.ErrorIs(t, err, provider.ErrProviderNotActive)
+		_, err = retained.ChatStream(ctx, nil, &chat.ChatOptions{})
+		require.ErrorIs(t, err, provider.ErrProviderNotActive)
+	}
 	for _, capability := range []provider.Capability{
 		provider.CapabilityChat, provider.CapabilityEmbedding, provider.CapabilityRerank,
 	} {
@@ -564,16 +591,6 @@ type memoryExternalStore struct {
 	bindings      map[string]*control.DataSourcePluginBinding
 }
 
-func (s *memoryExternalStore) CreateInstallation(_ context.Context, value *control.PluginInstallation) error {
-	copy := *value
-	s.installations[value.ID] = &copy
-	return nil
-}
-func (s *memoryExternalStore) CreateBinding(_ context.Context, value *control.DataSourcePluginBinding) error {
-	copy := *value
-	s.bindings[value.DataSourceID] = &copy
-	return nil
-}
 func (s *memoryExternalStore) GetInstallation(_ context.Context, id string) (*control.PluginInstallation, error) {
 	value, exists := s.installations[id]
 	if !exists {
@@ -597,50 +614,24 @@ func (s *memoryExternalStore) UpdateInstallationState(_ context.Context, id stri
 }
 
 func TestExternalPluginCannotBecomeReadyWithoutRuntime(t *testing.T) {
-	store := &memoryExternalStore{installations: map[string]*control.PluginInstallation{}, bindings: map[string]*control.DataSourcePluginBinding{}}
-	manager := New(catalog.New(), store)
-	manifest := externalManifest()
 	installation := &control.PluginInstallation{
-		ID: "installation-1", PluginID: manifest.Metadata.ID, Version: manifest.Metadata.Version,
-		ArtifactDigest: "sha256:test",
+		ID: "installation-1", PluginID: "community.local-files", Version: "0.1.0",
+		ArtifactDigest: "sha256:test", Active: true, InstallStatus: control.InstallStatusInstalled,
 	}
-	if err := manager.InstallExternal(context.Background(), manifest, installation); err != nil {
-		t.Fatal(err)
+	store := &memoryExternalStore{
+		installations: map[string]*control.PluginInstallation{installation.ID: installation},
+		bindings: map[string]*control.DataSourcePluginBinding{
+			"ds-1": {DataSourceID: "ds-1", InstallationID: installation.ID, ExtensionID: "local_directory", Generation: 1},
+		},
 	}
-	binding := &control.DataSourcePluginBinding{
-		DataSourceID: "ds-1", InstallationID: installation.ID,
-		ExtensionID: manifest.Spec.Extension.ID, Generation: 1,
-	}
-	if err := manager.BindDataSource(context.Background(), binding); err != nil {
-		t.Fatal(err)
-	}
+	manager := New(catalog.New(), store)
 	if err := manager.EnableExternal(context.Background(), installation.ID); !errors.Is(err, ErrRuntimeNotAvailable) {
 		t.Fatalf("enable error = %v", err)
 	}
-	status, err := manager.Status(manifest.Metadata.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.State != control.StateNotReady || status.State == control.StateReady {
-		t.Fatalf("external state = %s", status.State)
-	}
+	_, err := manager.Status(installation.PluginID)
+	require.ErrorIs(t, err, ErrNotFound, "external runtime state belongs to its Binding observation")
 	if persisted := store.installations[installation.ID]; persisted.Enabled || persisted.LastError != ErrRuntimeNotAvailable.Error() {
 		t.Fatalf("external installation was made runnable: %#v", persisted)
-	}
-}
-
-func externalManifest() control.Manifest {
-	return control.Manifest{
-		APIVersion: control.ManifestAPIVersion, Kind: control.ManifestKind,
-		Metadata: control.ManifestMetadata{ID: "community.local-files", Name: "Local Files", Version: "0.1.0"},
-		Spec: control.ManifestSpec{
-			ProtocolVersion: "1.0", Compatibility: control.ManifestCompatibility{WeKnora: ">=0.7.0 <0.8.0"},
-			Extension:    control.ManifestExtension{ID: "local_directory", Type: control.ExtensionDataSource, ContractVersion: "1.0", Capabilities: []string{"full_sync"}},
-			Runtime:      control.ManifestRuntime{Kind: control.RuntimeSandbox, Entrypoint: "bin/plugin", Transport: control.TransportUDS},
-			Permissions:  control.ManifestPermissions{Network: control.NetworkNone, Filesystem: control.FilesystemReadOnly},
-			Resources:    control.ManifestResources{MemoryMiB: 256, CPUQuota: 0.5, MaxProcesses: 32},
-			ConfigSchema: map[string]any{"type": "object", "additionalProperties": false},
-		},
 	}
 }
 
@@ -679,37 +670,28 @@ func (r managerRuntime) Stop(context.Context, pluginruntime.RuntimeHandle, time.
 	return r.stopErr
 }
 
+func managerWithRuntime(t *testing.T, store *memoryExternalStore, runtime pluginruntime.Runtime) *PluginManager {
+	t.Helper()
+	manager := NewWithVersion(catalog.New(), store, "")
+	require.NoError(t, manager.ConfigureRuntime(runtime))
+	return manager
+}
+
 func TestExternalPluginBecomesReadyOnlyAfterRuntimeStartReturns(t *testing.T) {
 	store := &memoryExternalStore{installations: map[string]*control.PluginInstallation{
 		"installation-1": {ID: "installation-1", PluginID: "community.local-files", Version: "0.1.0", Active: true},
 	}, bindings: map[string]*control.DataSourcePluginBinding{
 		"ds-1": {DataSourceID: "ds-1", InstallationID: "installation-1", ExtensionID: "local", Generation: 1},
 	}}
-	manager := NewWithRuntime(catalog.New(), store, "", managerRuntime{})
-	manager.statuses["community.local-files"] = control.PluginStatus{PluginID: "community.local-files", State: control.StateStopped}
+	manager := managerWithRuntime(t, store, managerRuntime{})
 	require.NoError(t, manager.EnableExternal(context.Background(), "installation-1"))
-	status, err := manager.Status("community.local-files")
-	require.NoError(t, err)
-	require.Equal(t, control.StateStarting, status.State)
 	handle, err := manager.StartExternal(context.Background(), "installation-1", pluginruntime.InstanceSpec{
 		PluginID: "community.local-files", PluginVersion: "0.1.0", ExtensionID: "local", DataSourceID: "ds-1", Generation: 1,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, handle)
-	status, err = manager.Status("community.local-files")
-	require.NoError(t, err)
-	require.Equal(t, control.StateReady, status.State)
-}
-
-func TestExternalRuntimeRejectsMissingBinding(t *testing.T) {
-	store := &memoryExternalStore{installations: map[string]*control.PluginInstallation{
-		"installation-1": {ID: "installation-1", PluginID: "community.local-files", Version: "0.1.0", Active: true},
-	}, bindings: map[string]*control.DataSourcePluginBinding{}}
-	manager := NewWithRuntime(catalog.New(), store, "", managerRuntime{})
-	_, err := manager.StartExternal(context.Background(), "installation-1", pluginruntime.InstanceSpec{
-		PluginID: "community.local-files", PluginVersion: "0.1.0", ExtensionID: "local", DataSourceID: "ds-unbound", Generation: 1,
-	})
-	require.ErrorContains(t, err, "load datasource plugin binding")
+	_, err = manager.Status("community.local-files")
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestExternalRuntimeFailureKeepsDesiredEnabledForReconcile(t *testing.T) {
@@ -718,16 +700,38 @@ func TestExternalRuntimeFailureKeepsDesiredEnabledForReconcile(t *testing.T) {
 	}, bindings: map[string]*control.DataSourcePluginBinding{
 		"ds-1": {DataSourceID: "ds-1", InstallationID: "installation-1", ExtensionID: "local", Generation: 1},
 	}}
-	manager := NewWithRuntime(catalog.New(), store, "", managerRuntime{startErr: errors.New("health not ready")})
-	manager.statuses["community.local-files"] = control.PluginStatus{PluginID: "community.local-files", State: control.StateStarting}
+	manager := managerWithRuntime(t, store, managerRuntime{startErr: errors.New("health not ready")})
 	_, err := manager.StartExternal(context.Background(), "installation-1", pluginruntime.InstanceSpec{
 		PluginID: "community.local-files", PluginVersion: "0.1.0", ExtensionID: "local", DataSourceID: "ds-1", Generation: 1,
 	})
 	require.ErrorContains(t, err, "health not ready")
 	require.True(t, store.installations["installation-1"].Enabled)
-	status, statusErr := manager.Status("community.local-files")
-	require.NoError(t, statusErr)
-	require.Equal(t, control.StateNotReady, status.State)
+	require.Empty(t, store.installations["installation-1"].LastError,
+		"instance failure must be recorded on its Binding, not the shared installation")
+	_, statusErr := manager.Status("community.local-files")
+	require.ErrorIs(t, statusErr, ErrNotFound)
+}
+
+func TestExternalBindingsKeepIndependentRuntimeHandlesWithoutPackageStatus(t *testing.T) {
+	store := &memoryExternalStore{installations: map[string]*control.PluginInstallation{
+		"installation-1": {ID: "installation-1", PluginID: "community.local-files", Version: "0.1.0", Active: true, Enabled: true},
+	}, bindings: map[string]*control.DataSourcePluginBinding{
+		"ds-1": {DataSourceID: "ds-1", InstallationID: "installation-1", ExtensionID: "local", Generation: 1},
+		"ds-2": {DataSourceID: "ds-2", InstallationID: "installation-1", ExtensionID: "local", Generation: 1},
+	}}
+	manager := managerWithRuntime(t, store, managerRuntime{})
+	for _, dataSourceID := range []string{"ds-1", "ds-2"} {
+		_, err := manager.StartExternal(context.Background(), "installation-1", pluginruntime.InstanceSpec{
+			PluginID: "community.local-files", PluginVersion: "0.1.0", ExtensionID: "local", DataSourceID: dataSourceID, Generation: 1,
+		})
+		require.NoError(t, err)
+	}
+	require.Len(t, manager.handles, 2)
+	_, err := manager.Status("community.local-files")
+	require.ErrorIs(t, err, ErrNotFound)
+	require.NoError(t, manager.StopExternal(context.Background(), "installation-1", "ds-1", time.Second))
+	require.Nil(t, manager.handles["ds-1"])
+	require.NotNil(t, manager.handles["ds-2"])
 }
 
 func TestExternalStopFailureDoesNotRetainUnroutableHandle(t *testing.T) {
@@ -736,8 +740,7 @@ func TestExternalStopFailureDoesNotRetainUnroutableHandle(t *testing.T) {
 	}, bindings: map[string]*control.DataSourcePluginBinding{
 		"ds-1": {DataSourceID: "ds-1", InstallationID: "installation-1", ExtensionID: "local", Generation: 1},
 	}}
-	manager := NewWithRuntime(catalog.New(), store, "", managerRuntime{stopErr: errors.New("backend cleanup failed")})
-	manager.statuses["community.local-files"] = control.PluginStatus{PluginID: "community.local-files", State: control.StateStarting}
+	manager := managerWithRuntime(t, store, managerRuntime{stopErr: errors.New("backend cleanup failed")})
 	spec := pluginruntime.InstanceSpec{PluginID: "community.local-files", PluginVersion: "0.1.0", ExtensionID: "local", DataSourceID: "ds-1", Generation: 1}
 	_, err := manager.StartExternal(context.Background(), "installation-1", spec)
 	require.NoError(t, err)

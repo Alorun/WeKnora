@@ -32,15 +32,7 @@ type managedEngine struct {
 }
 
 func (s *managedEngine) acquire() (func(), error) {
-	if s.lease == nil || !s.lease.active.Load() {
-		return nil, ErrDriverNotActive
-	}
-	s.lease.mu.RLock()
-	if !s.lease.active.Load() {
-		s.lease.mu.RUnlock()
-		return nil, ErrDriverNotActive
-	}
-	return s.lease.mu.RUnlock, nil
+	return s.lease.acquire()
 }
 
 func (s *managedEngine) Retrieve(ctx context.Context, params types.RetrieveParams) ([]*types.RetrieveResult, error) {

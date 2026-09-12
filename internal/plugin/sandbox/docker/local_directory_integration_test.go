@@ -83,7 +83,7 @@ func TestLocalDirectoryRuntime(t *testing.T) {
 	installation.Enabled = true
 	require.NoError(t, store.CreateInstallation(ctx, &installation))
 	binding := control.DataSourcePluginBinding{DataSourceID: ds.ID, InstallationID: installation.ID, ExtensionID: "local_directory", Generation: 1, ObservedState: control.StateStopped}
-	require.NoError(t, store.CreateBinding(ctx, &binding))
+	require.NoError(t, db.Create(&binding).Error)
 	source := filepath.Join(c.GrantRoots[0].AppRoot, "source")
 	require.NoError(t, os.MkdirAll(source, 0755))
 	put := func(name, body string) {
@@ -216,7 +216,11 @@ func TestLocalDirectoryRuntime(t *testing.T) {
 	require.NoError(t, runtime.Stop(ctx, handle, time.Second))
 	assertClean(t, b, spec, handle.InstanceID())
 	// Same formal Store/Builder rejects a revoked Grant before a new Start.
-	require.NoError(t, store.RevokeDirectoryGrant(ctx, grant.ID, 2))
+	require.NoError(t, db.Model(&control.DirectoryGrant{}).Where("id = ?", grant.ID).Updates(map[string]any{
+		"status":     control.GrantStatusRevoked,
+		"generation": 2,
+		"revoked_at": time.Now().UTC(),
+	}).Error)
 	_, err = builder.BuildInstanceSpec(ctx, installation, binding)
 	require.Error(t, err)
 	list, err := b.List(ctx, nil)

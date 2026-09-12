@@ -351,24 +351,6 @@ func FindDockerCgroup(root, containerID string) (string, error) {
 	return found, nil
 }
 
-// CurrentCgroupPath resolves the caller's cgroup in a host cgroup namespace.
-func CurrentCgroupPath(root string) (string, error) {
-	data, err := os.ReadFile("/proc/self/cgroup")
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "0::") {
-			path := filepath.Join(root, strings.TrimPrefix(line, "0::"))
-			if _, err := os.Stat(path); err != nil {
-				return "", fmt.Errorf("stat current cgroup: %w", err)
-			}
-			return path, nil
-		}
-	}
-	return "", errors.New("cgroup v2 entry not found")
-}
-
 // CgroupID returns the kernfs inode used by bpf_get_current_cgroup_id.
 func CgroupID(path string) (uint64, error) {
 	var stat syscall.Stat_t

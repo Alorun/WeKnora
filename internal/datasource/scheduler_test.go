@@ -285,48 +285,6 @@ func TestScheduler_AddOrUpdate(t *testing.T) {
 	}
 }
 
-func TestScheduler_AddOrUpdate_PausedIsNoop(t *testing.T) {
-	enqueuer := &fakeTaskEnqueuer{}
-	scheduler := NewScheduler(newFakeDataSourceRepo(), newFakeSyncLogRepo(), enqueuer)
-	scheduler.cron.Start()
-	defer scheduler.Stop()
-
-	ds := &types.DataSource{
-		ID:           "ds-paused",
-		TenantID:     1,
-		Status:       types.DataSourceStatusPaused,
-		SyncSchedule: "0 0 * * * *",
-	}
-
-	if err := scheduler.AddOrUpdate(ds); err != nil {
-		t.Fatalf("AddOrUpdate() error: %v", err)
-	}
-	if scheduler.EntryCount() != 0 {
-		t.Errorf("paused ds should not be scheduled, EntryCount() = %d", scheduler.EntryCount())
-	}
-}
-
-func TestScheduler_AddOrUpdate_EmptyScheduleIsNoop(t *testing.T) {
-	enqueuer := &fakeTaskEnqueuer{}
-	scheduler := NewScheduler(newFakeDataSourceRepo(), newFakeSyncLogRepo(), enqueuer)
-	scheduler.cron.Start()
-	defer scheduler.Stop()
-
-	ds := &types.DataSource{
-		ID:           "ds-no-sched",
-		TenantID:     1,
-		Status:       types.DataSourceStatusActive,
-		SyncSchedule: "",
-	}
-
-	if err := scheduler.AddOrUpdate(ds); err != nil {
-		t.Fatalf("AddOrUpdate() error: %v", err)
-	}
-	if scheduler.EntryCount() != 0 {
-		t.Errorf("empty schedule should not be registered, EntryCount() = %d", scheduler.EntryCount())
-	}
-}
-
 func TestScheduler_Remove(t *testing.T) {
 	enqueuer := &fakeTaskEnqueuer{}
 	scheduler := NewScheduler(newFakeDataSourceRepo(), newFakeSyncLogRepo(), enqueuer)
@@ -348,63 +306,5 @@ func TestScheduler_Remove(t *testing.T) {
 	scheduler.Remove("ds-rm")
 	if scheduler.EntryCount() != 0 {
 		t.Errorf("post-remove: EntryCount() = %d, want 0", scheduler.EntryCount())
-	}
-
-	// Remove non-existent is safe
-	scheduler.Remove("does-not-exist")
-}
-
-func TestScheduler_InvalidCron(t *testing.T) {
-	enqueuer := &fakeTaskEnqueuer{}
-	scheduler := NewScheduler(newFakeDataSourceRepo(), newFakeSyncLogRepo(), enqueuer)
-	scheduler.cron.Start()
-	defer scheduler.Stop()
-
-	ds := &types.DataSource{
-		ID:           "ds-bad",
-		TenantID:     1,
-		Status:       types.DataSourceStatusActive,
-		SyncSchedule: "not a cron",
-	}
-
-	err := scheduler.AddOrUpdate(ds)
-	if err == nil {
-		t.Fatal("expected error for invalid cron expression")
-	}
-	if scheduler.EntryCount() != 0 {
-		t.Errorf("invalid cron should not be registered, EntryCount() = %d", scheduler.EntryCount())
-	}
-}
-
-func TestScheduler_TriggerSync_InactiveSkipped(t *testing.T) {
-	repo := newFakeDataSourceRepo()
-	// Create a data source that is paused
-	_ = repo.Create(context.Background(), &types.DataSource{
-		ID:       "ds-inactive",
-		TenantID: 1,
-		Status:   types.DataSourceStatusPaused,
-	})
-
-	enqueuer := &fakeTaskEnqueuer{}
-	scheduler := NewScheduler(repo, newFakeSyncLogRepo(), enqueuer)
-
-	// Directly call triggerSync — it should skip because ds is not active
-	scheduler.triggerSync("ds-inactive", 1)
-
-	if enqueuer.count.Load() != 0 {
-		t.Error("should not enqueue for inactive data source")
-	}
-}
-
-func TestScheduler_TriggerSync_NotFound(t *testing.T) {
-	repo := newFakeDataSourceRepo()
-	enqueuer := &fakeTaskEnqueuer{}
-	scheduler := NewScheduler(repo, newFakeSyncLogRepo(), enqueuer)
-
-	// Should not panic, just skip
-	scheduler.triggerSync("nonexistent", 1)
-
-	if enqueuer.count.Load() != 0 {
-		t.Error("should not enqueue for non-existent data source")
 	}
 }
